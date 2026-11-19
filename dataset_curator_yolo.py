@@ -1301,6 +1301,11 @@ def make_handler(server):
                         result = server.edit_image(body.get("id", ""), body.get("boxes", []))
                     print(f"[CleanCrop] Box editor: {result['message']}")
                     self._json(result)
+                elif self.path == "/api/export_clean":
+                    with server.lock:
+                        result = export_clean_timestamped(server.output_dir)
+                    print(f"[CleanCrop] Export clean: {result.get('message') or result.get('out_dir')}")
+                    self._json(result, 200 if result["status"] == "ok" else 400)
                 elif self.path == "/api/writeback":
                     actions = self._body().get("actions", [])
                     with server.lock:
@@ -1775,6 +1780,17 @@ def _parse_box_line(line):
     if bb[2] <= 0 or bb[3] <= 0:
         return None
     return c, bb
+
+
+def export_clean_timestamped(output_dir):
+    """Runs export_clean into <output_dir>/clean_export_<timestamp> (used by the dashboard button).
+    Returns {"status": "ok", "out_dir": ..., **summary} or {"status": "error", "message": ...}."""
+    out_dir = os.path.join(os.path.abspath(output_dir), "clean_export_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    try:
+        summary = export_clean(output_dir, out_dir)
+    except SystemExit as e:
+        return {"status": "error", "message": str(e)}
+    return {"status": "ok", "out_dir": out_dir, **(summary or {})}
 
 
 def export_clean(output_dir, out_dir):

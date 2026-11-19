@@ -77,6 +77,21 @@
     let suppressClick = false;
     let lastDragDist = 0;
 
+    // 3D camera: orbit centre (data space), perspective distance, auto-rotate, pan drag
+    let orbitCenter = [0, 0, 0];
+    let camDist = 6;            // in data units; set from the data extent
+    let dataExtent = 1;
+    let autoRotate = false;
+    let isPanning = false;
+    let projCache = [];          // per item: [sx, sy, z, radius] or null when hidden (what was drawn)
+    // Global filters (plot + grids)
+    const gFilter = { cls: '', cam: '', period: '', flagged: false, unreviewed: false };
+    let clusterFilter = null;    // cluster id or null
+    let clusterHulls = null;     // cache: [{cluster, hull:[[x,y]...]}] in map2d data space
+    // Pinned point window: navigation list mode
+    let popNavMode = 'cluster';  // 'cluster' | 'flagged'
+    let popPos = null;           // remembered position after the user drags it
+
     const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     const pct = v => (v === null || v === undefined) ? 'n/a' : `${(v * 100).toFixed(0)}%`;
 
@@ -98,6 +113,7 @@
         setupActionButtons();
         setupFrameViewer();
         setupKeyboard();
+        setupUiExtras();
 
         await loadSavedState();
         loadDataset(window.CURATION_REPORT);
@@ -193,6 +209,25 @@
 
         pcaCoordinates = report.items.map(it => it.pca || [0, 0, 0]);
         map2dCoordinates = report.items.map(it => it.map2d || null);
+        // 3D camera: orbit around the data centre, perspective distance from the data extent
+        const n = pcaCoordinates.length || 1;
+        orbitCenter = [0, 1, 2].map(k => pcaCoordinates.reduce((s, c) => s + (c[k] || 0), 0) / n);
+        dataExtent = Math.max(1e-6, ...pcaCoordinates.map(c => Math.hypot(c[0] - orbitCenter[0], c[1] - orbitCenter[1], (c[2] || 0) - orbitCenter[2])));
+        camDist = dataExtent * 4;
+        // camera / day-night per box (newer reports carry them; older ones: parse the file name)
+        report.items.forEach(it => {
+            const m = /^(.+?)_(nvr-\d+_\d+)_(\d{8})_(\d{6})/.exec(it.image || '');
+            if (!it.camera) it.camera = m ? m[2] : 'unknown';
+            if (!it.period) { const h = m ? +m[4].slice(0, 2) : null; it.period = h === null ? 'unknown' : (h >= 6 && h < 18 ? 'day' : 'night'); }
+        });
+        const fillSel = (id, all, vals) => {
+            const el = document.getElementById(id);
+            if (el) el.innerHTML = `<option value="">${all}</option>` + vals.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
+        };
+        fillSel('gf-class', 'All classes', classNames);
+        fillSel('gf-camera', 'All cameras', [...new Set(report.items.map(it => it.camera))].sort());
+        fillSel('gf-period', 'Day + night', [...new Set(report.items.map(it => it.period))].sort());
+        clusterHulls = null;
 
         recomputeCuration();
         resetCanvasView();
@@ -234,8 +269,8 @@
         // Train/val leaks first - they inflate your validation scores
         duplicateList.sort((x, y) => (y.a.split !== y.b.split) - (x.a.split !== x.b.split) || y.similarity - x.similarity);
 
-        mislabelList = items.filter(it => it.is_mislabeled).sort((a, b) => b.pred_conf - a.pred_conf);
-        outlierList = items.filter(it => it.is_outlier).sort((a, b) => b.lof - a.lof);
+        mislabelList = items.filter(it => it.is_mislabeled && passesFilter(it)).sort((a, b) => b.pred_conf - a.pred_conf);
+        outlierList = items.filter(it => it.is_outlier && passesFilter(it)).sort((a, b) => b.lof - a.lof);
         issueList = items.filter(it => it.has_issue);
 
         const active = items.filter(it => !it.curDeleted);
@@ -294,6 +329,9 @@
         renderActiveTab();
         drawCanvas();
         updateExportBar();
+        updateTopStatus();
+        renderClusterGrid();
+        updateFsSide();
     }
 
     const TAB_TITLES = {
@@ -305,6 +343,7 @@
         explorer: ["All Boxes", "Search, filter and review any box. Click a thumbnail to inspect it."],
         backgrounds: ["Backgrounds", "Images with no boxes (empty or missing label file). They teach the model what NOT to detect. Click one to see it full size."],
         distribution: ["Distribution", "Where the data comes from (cameras, devices, day/night, box sizes) and whether it is ready for a golden test set."],
+        ready: ["Training ready?", "A last check before training: what is still unreviewed, backgrounds, golden test set. Then export a clean copy of the dataset."],
     };
 
     function switchTab(tabId) {
@@ -334,6 +373,7 @@
             case 'explorer': renderExplorerTab(); break;
             case 'backgrounds': renderBackgroundsTab(); break;
             case 'distribution': renderDistributionTab(); break;
+            case 'ready': renderReadyTab(); break;
         }
     }
 
@@ -612,7 +652,7 @@
         const selectedFlag = document.getElementById('filter-anomaly').value;
         const sortBy = document.getElementById('sort-by').value;
 
-        let filtered = reportData.items.filter(it => !it.removed);
+        let filtered = reportData.items.filter(it => !it.removed && passesFilter(it));
         if (searchVal) filtered = filtered.filter(it => it.id.toLowerCase().includes(searchVal) || it.image.toLowerCase().includes(searchVal));
         if (selectedClass !== 'all') filtered = filtered.filter(it => it.curLabel === selectedClass);
         if (selectedSplit !== 'all') filtered = filtered.filter(it => it.split === selectedSplit);
@@ -827,28 +867,58 @@
     // REVIEW ACTIONS
     // ==========================================================================
 
+    // Snapshot of the decisions for some boxes, so a toast "Undo" can put them back exactly
+    function takeSnap(ids) {
+        return ids.map(id => ({
+            id, del: deletedIds.has(id), kept: keptIds.has(id),
+            rel: relabeledLabels.has(id) ? relabeledLabels.get(id) : null,
+            log: actionsLog.find(a => a.id === id) || null,
+        }));
+    }
+
+    function restoreSnap(snap) {
+        snap.forEach(s => {
+            if (s.del) deletedIds.add(s.id); else deletedIds.delete(s.id);
+            if (s.kept) keptIds.add(s.id); else keptIds.delete(s.id);
+            if (s.rel !== null) relabeledLabels.set(s.id, s.rel); else relabeledLabels.delete(s.id);
+            for (let i = actionsLog.length - 1; i >= 0; i--) if (actionsLog[i].id === s.id) actionsLog.splice(i, 1);
+            if (s.log) actionsLog.push(s.log);
+        });
+        saveState();
+        recomputeCuration();
+        if (pointPopupIdx >= 0) refreshPointPopup();
+    }
+
     function excludeCrop(id, description = "") {
+        const snap = takeSnap([id]);
         deletedIds.add(id);
         keptIds.delete(id);
         registerAction({ type: 'delete', id, description: description || `Deleted ${id}.` });
         recomputeCuration();
+        showToast('Box marked for removal.', snap);
     }
 
     function approveCrop(id, description = "") {
+        const snap = takeSnap([id]);
+        deletedIds.delete(id);
         keptIds.add(id);
         registerAction({ type: 'keep', id, description: description || `Confirmed ${id}.` });
         recomputeCuration();
+        showToast('Box approved.', snap);
     }
 
     function relabelCrop(id, oldLabel, newLabel) {
+        const snap = takeSnap([id]);
         const item = itemById(id);
         if (item && newLabel === item.label) relabeledLabels.delete(id);
         else relabeledLabels.set(id, newLabel);
         registerAction({ type: 'relabel', id, old_label: oldLabel, new_label: newLabel, description: `Relabeled ${id}: '${oldLabel}' → '${newLabel}'.` });
         recomputeCuration();
+        showToast(`Relabeled ${oldLabel} → ${newLabel}.`, snap);
     }
 
     function undoCrop(id) {
+        const snap = takeSnap([id]);
         deletedIds.delete(id);
         relabeledLabels.delete(id);
         keptIds.delete(id);
@@ -857,6 +927,21 @@
         }
         saveState();
         recomputeCuration();
+        showToast('Decision undone.', snap, 'Redo');
+    }
+
+    let toastTimer = null;
+    function showToast(msg, snap, undoText = 'Undo') {
+        const t = document.getElementById('toast');
+        if (!t) return;
+        t.innerHTML = `<span>${esc(msg)}</span>${snap ? `<button class="btn btn-small" id="toast-undo">${esc(undoText)}</button>` : ''}<button class="toast-x" title="Close">×</button>`;
+        const host = document.fullscreenElement || document.body;
+        if (t.parentElement !== host) host.appendChild(t);
+        t.classList.remove('hidden');
+        if (snap) t.querySelector('#toast-undo').onclick = () => { t.classList.add('hidden'); restoreSnap(snap); };
+        t.querySelector('.toast-x').onclick = () => t.classList.add('hidden');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => t.classList.add('hidden'), 6000);
     }
 
     function registerAction(act) {
@@ -891,41 +976,55 @@
     // INTERACTIVE CANVAS PLOT RENDERING
     // ==========================================================================
     
-    function getProjectedCoord(idx) {
-        const coords = pcaCoordinates[idx];
-        if (!coords) return [0, 0, 0];
-        const x = coords[0];
-        const y = coords[1];
-        const z = coords[2] || 0;
-        
-        if (!is3D) {
-            const m = map2dCoordinates[idx];
-            return m ? [m[0], m[1], 0] : [x, y, 0];
-        }
-        
-        const cosY = Math.cos(rotationY);
-        const sinY = Math.sin(rotationY);
-        const cosX = Math.cos(rotationX);
-        const sinX = Math.sin(rotationX);
+    // Canvas colours follow the theme (CSS variables can't be used on a canvas directly)
+    let themeColors = { bg: '#090c10', grid: 'rgba(255,255,255,0.04)', axis: 'rgba(255,255,255,0.55)', text: '#c9d1d9', floor: 'rgba(255,255,255,0.07)', ring: '#ffffff' };
+    function readThemeColors() {
+        const cs = getComputedStyle(document.documentElement);
+        const v = (n, fb) => (cs.getPropertyValue(n) || '').trim() || fb;
+        themeColors = {
+            bg: v('--canvas-bg', '#090c10'), grid: v('--canvas-grid', 'rgba(255,255,255,0.04)'),
+            axis: v('--canvas-axis', 'rgba(255,255,255,0.55)'), text: v('--canvas-text', '#c9d1d9'),
+            floor: v('--canvas-floor', 'rgba(255,255,255,0.07)'), ring: v('--canvas-ring', '#ffffff'),
+        };
+    }
 
-        // Rotate Y
+    // data point (3D, PCA space) -> [x, y, depth, perspective scale] around the orbit centre
+    function project3(x, y, z) {
+        x -= orbitCenter[0]; y -= orbitCenter[1]; z -= orbitCenter[2];
+        const cosY = Math.cos(rotationY), sinY = Math.sin(rotationY);
+        const cosX = Math.cos(rotationX), sinX = Math.sin(rotationX);
         const x1 = x * cosY - z * sinY;
         const z1 = x * sinY + z * cosY;
-
-        // Rotate X
         const y2 = y * cosX - z1 * sinX;
         const z2 = y * sinX + z1 * cosX;
-        
-        return [x1, y2, z2];
+        // perspective: larger z2 = closer to the camera = drawn bigger
+        const f = camDist / Math.max(camDist * 0.2, camDist - z2);
+        return [x1 * f, y2 * f, z2, f];
     }
-    
+
+    function getProjectedCoord(idx) {
+        const coords = pcaCoordinates[idx];
+        if (!coords) return [0, 0, 0, 1];
+        if (!is3D) {
+            const m = map2dCoordinates[idx];
+            return m ? [m[0], m[1], 0, 1] : [coords[0], coords[1], 0, 1];
+        }
+        return project3(coords[0], coords[1], coords[2] || 0);
+    }
+
+    const toScreen = p => [p[0] * viewZoom + viewPanX, p[1] * viewZoom + viewPanY];
+    let fitZoom = 1;
+    let lastMouse = null;
+
+    function dataCentre() {
+        const n = pcaCoordinates.length || 1;
+        return [0, 1, 2].map(k => pcaCoordinates.reduce((s, c) => s + (c[k] || 0), 0) / n);
+    }
+
     function resetCanvasView() {
         if (pcaCoordinates.length === 0) return;
-        
-        // Find dimensions min/max
-        let minX = Infinity, maxX = -Infinity;
-        let minY = Infinity, maxY = -Infinity;
-        
+        if (is3D) orbitCenter = dataCentre();
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
         pcaCoordinates.forEach((_, i) => {
             const [x, y] = getProjectedCoord(i);
             if (x < minX) minX = x;
@@ -933,223 +1032,220 @@
             if (y < minY) minY = y;
             if (y > maxY) maxY = y;
         });
-        
         const padX = (maxX - minX) * 0.15 || 1.0;
         const padY = (maxY - minY) * 0.15 || 1.0;
-        
         minX -= padX; maxX += padX;
         minY -= padY; maxY += padY;
-        
         const width = canvas.clientWidth;
         const height = canvas.clientHeight;
-        
-        // Scale to fit canvas
-        const scaleX = width / (maxX - minX);
-        const scaleY = height / (maxY - minY);
-        viewZoom = Math.min(scaleX, scaleY);
-        
-        // Pan to center
+        viewZoom = Math.min(width / (maxX - minX), height / (maxY - minY));
+        if (!isFinite(viewZoom) || viewZoom <= 0) viewZoom = 1;
+        fitZoom = viewZoom;
         viewPanX = width / 2 - (minX + maxX) / 2 * viewZoom;
         viewPanY = height / 2 - (minY + maxY) / 2 * viewZoom;
-        
         drawCanvas();
     }
-    
+
+    function isVisible(it) {
+        if (it.removed) return false;
+        if (clusterFilter !== null && it.cluster !== clusterFilter) return false;
+        return passesFilter(it);
+    }
+
+    function drawLine3(a, b) {
+        const pa = toScreen(project3(...a)), pb = toScreen(project3(...b));
+        ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke();
+        return [pa, pb];
+    }
+
+    function drawFloorAndAxes() {
+        const c = dataCentre();
+        const E = dataExtent * 0.9;
+        // light grid floor under the cloud (data +y is screen-down at the default view)
+        ctx.save();
+        ctx.strokeStyle = themeColors.floor;
+        ctx.lineWidth = 1;
+        const fy = c[1] + E, steps = 8;
+        for (let s = 0; s <= steps; s++) {
+            const t = -E + (2 * E * s) / steps;
+            drawLine3([c[0] + t, fy, c[2] - E], [c[0] + t, fy, c[2] + E]);
+            drawLine3([c[0] - E, fy, c[2] + t], [c[0] + E, fy, c[2] + t]);
+        }
+        // X / Y / Z axes through the data centre, with labels
+        const axes = [['X (PC1)', [E, 0, 0], '#f87171'], ['Y (PC2)', [0, E, 0], '#4ade80'], ['Z (PC3)', [0, 0, E], '#60a5fa']];
+        ctx.lineWidth = 1.6;
+        ctx.font = '600 12px "Plus Jakarta Sans", sans-serif';
+        axes.forEach(([name, d, col]) => {
+            ctx.strokeStyle = col;
+            ctx.globalAlpha = 0.85;
+            const [, pb] = drawLine3([c[0] - d[0], c[1] - d[1], c[2] - d[2]], [c[0] + d[0], c[1] + d[1], c[2] + d[2]]);
+            ctx.globalAlpha = 1;
+            ctx.fillStyle = col;
+            ctx.beginPath(); ctx.arc(pb[0], pb[1], 3, 0, Math.PI * 2); ctx.fill();
+            ctx.fillText(name, pb[0] + 6, pb[1] - 6);
+        });
+        ctx.restore();
+    }
+
+    // ---- convex hulls of clusters on the 2D map ----
+    function convexHull(pts) {
+        if (pts.length < 3) return pts.slice();
+        const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+        const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+        const lower = [], upper = [];
+        for (const q of p) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], q) <= 0) lower.pop(); lower.push(q); }
+        for (let i = p.length - 1; i >= 0; i--) { const q = p[i]; while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], q) <= 0) upper.pop(); upper.push(q); }
+        upper.pop(); lower.pop();
+        return lower.concat(upper);
+    }
+
+    function getClusterHulls() {
+        if (clusterHulls) return clusterHulls;
+        const groups = new Map();
+        reportData.items.forEach((it, i) => {
+            if (it.removed || it.cluster === null || it.cluster === undefined || !map2dCoordinates[i]) return;
+            if (!groups.has(it.cluster)) groups.set(it.cluster, []);
+            groups.get(it.cluster).push(map2dCoordinates[i]);
+        });
+        clusterHulls = [...groups.entries()].map(([cluster, pts]) => ({ cluster, hull: convexHull(pts) }));
+        return clusterHulls;
+    }
+
+    function drawClusterHulls() {
+        ctx.save();
+        getClusterHulls().forEach(({ cluster, hull }) => {
+            if (hull.length < 3 || (clusterFilter !== null && cluster !== clusterFilter)) return;
+            const col = clusterColor(cluster);
+            ctx.beginPath();
+            hull.forEach((p, k) => { const [x, y] = toScreen(p); k ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+            ctx.closePath();
+            ctx.globalAlpha = 0.07; ctx.fillStyle = col; ctx.fill();
+            ctx.globalAlpha = 0.8; ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]); ctx.stroke();
+            ctx.setLineDash([]);
+            const top = hull.reduce((a, b) => (b[1] < a[1] ? b : a));
+            const [tx, ty] = toScreen(top);
+            ctx.globalAlpha = 1; ctx.fillStyle = col; ctx.font = '700 12px "Plus Jakarta Sans", sans-serif';
+            ctx.fillText(`C${cluster}`, tx - 8, ty - 6);
+        });
+        ctx.restore();
+    }
+
     function drawCanvas() {
         if (!reportData || pcaCoordinates.length === 0) return;
-        
         const N = pcaCoordinates.length;
-        
-        // Adjust Canvas size for high-DPI displays
         const dpr = window.devicePixelRatio || 1;
         const rect = canvas.getBoundingClientRect();
         canvas.width = rect.width * dpr;
         canvas.height = rect.height * dpr;
-        ctx.scale(dpr, dpr);
-        
-        const width = rect.width;
-        const height = rect.height;
-        
-        // Clear background
-        ctx.fillStyle = '#090c10';
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        const width = rect.width, height = rect.height;
+
+        ctx.fillStyle = themeColors.bg;
         ctx.fillRect(0, 0, width, height);
-        
-        // Draw grid lines
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.03)';
-        ctx.lineWidth = 1;
-        const gridSize = 40 * viewZoom;
-        
-        const startX = viewPanX % gridSize;
-        for (let x = startX; x < width; x += gridSize) {
-            ctx.beginPath();
-            ctx.moveTo(x, 0);
-            ctx.lineTo(x, height);
-            ctx.stroke();
+
+        if (is3D) {
+            drawFloorAndAxes();
+        } else {
+            ctx.strokeStyle = themeColors.grid;
+            ctx.lineWidth = 1;
+            let gridSize = 0.1 * viewZoom;
+            while (gridSize < 30) gridSize *= 2;
+            while (gridSize > 120) gridSize /= 2;
+            for (let x = ((viewPanX % gridSize) + gridSize) % gridSize; x < width; x += gridSize) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke(); }
+            for (let y = ((viewPanY % gridSize) + gridSize) % gridSize; y < height; y += gridSize) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke(); }
+            if (hasClusters() && (colorBy === 'cluster' || clusterFilter !== null)) drawClusterHulls();
         }
-        
-        const startY = viewPanY % gridSize;
-        for (let y = startY; y < height; y += gridSize) {
-            ctx.beginPath();
-            ctx.moveTo(0, y);
-            ctx.lineTo(width, y);
-            ctx.stroke();
-        }
-        
+
         const items = reportData.items;
-        
-        // Calculate all projected 2D coordinates
-        const projectedCoords = pcaCoordinates.map((_, i) => getProjectedCoord(i));
-        
-        // Compute minZ/maxZ for depth cues
+        // Project everything once; this cache is also what hover / click / lasso use
         let minZ = Infinity, maxZ = -Infinity;
-        if (is3D) {
-            projectedCoords.forEach(coord => {
-                const z = coord[2];
-                if (z < minZ) minZ = z;
-                if (z > maxZ) maxZ = z;
-            });
+        projCache = new Array(N);
+        for (let i = 0; i < N; i++) {
+            if (!isVisible(items[i])) { projCache[i] = null; continue; }
+            const p = getProjectedCoord(i);
+            const [sx, sy] = toScreen(p);
+            projCache[i] = [sx, sy, p[2], 5 * (is3D ? p[3] * p[3] : 1)];
+            if (p[2] < minZ) minZ = p[2];
+            if (p[2] > maxZ) maxZ = p[2];
         }
-        
-        // Determine rendering order (depth sorting)
         const renderOrder = [];
-        for (let i = 0; i < N; i++) renderOrder.push(i);
-        if (is3D) {
-            renderOrder.sort((a, b) => projectedCoords[a][2] - projectedCoords[b][2]);
-        }
-        
-        // First Draw: Anomaly Rings/Halos (Bottom Layer)
+        for (let i = 0; i < N; i++) if (projCache[i]) renderOrder.push(i);
+        if (is3D) renderOrder.sort((a, b) => projCache[a][2] - projCache[b][2]);
+        const depthOf = z => (is3D && maxZ > minZ) ? (z - minZ) / (maxZ - minZ) : 1;
+        // point size by depth (3D): perspective^2 times a near/far factor, kept in a readable range
+        if (is3D) renderOrder.forEach(i => { const p = projCache[i]; p[3] = Math.max(2, Math.min(11, p[3] * (0.7 + 0.5 * depthOf(p[2])))); });
+
         if (showAnomalyRings) {
             renderOrder.forEach(i => {
                 const item = items[i];
-                if (item.curDeleted) return; // Hide rings for deleted
-                
-                const [px, py, pz] = projectedCoords[i];
-                
-                // Screen projection coordinates
-                const sx = px * viewZoom + viewPanX;
-                const sy = py * viewZoom + viewPanY;
-                
+                if (item.curDeleted) return;
+                const [sx, sy, z, r] = projCache[i];
                 if (sx < -20 || sx > width + 20 || sy < -20 || sy > height + 20) return;
-                
-                let depthFactor = 1.0;
-                if (is3D && maxZ > minZ) {
-                    depthFactor = 0.4 + 0.8 * ((pz - minZ) / (maxZ - minZ));
-                }
-                
                 ctx.save();
-                if (is3D) {
-                    ctx.globalAlpha = Math.max(0.1, depthFactor * 0.8);
-                }
-                
-                if (item.is_mislabeled) {
-                    drawGlowingHalo(sx, sy, 14 * depthFactor, 'rgba(245, 158, 11, 0.35)', 'rgba(245, 158, 11, 0)');
-                } else if (item.is_outlier || item.has_issue) {
-                    drawGlowingHalo(sx, sy, 14 * depthFactor, 'rgba(244, 63, 94, 0.25)', 'rgba(244, 63, 94, 0)');
-                } else if (item.is_duplicate) {
-                    drawGlowingHalo(sx, sy, 14 * depthFactor, 'rgba(0, 242, 254, 0.25)', 'rgba(0, 242, 254, 0)');
-                }
-                
+                if (is3D) ctx.globalAlpha = Math.max(0.15, 0.3 + 0.6 * depthOf(z));
+                const R = r * 2.8;
+                if (item.is_mislabeled) drawGlowingHalo(sx, sy, R, 'rgba(245, 158, 11, 0.35)', 'rgba(245, 158, 11, 0)');
+                else if (item.is_outlier || item.has_issue) drawGlowingHalo(sx, sy, R, 'rgba(244, 63, 94, 0.25)', 'rgba(244, 63, 94, 0)');
+                else if (item.is_duplicate) drawGlowingHalo(sx, sy, R, 'rgba(0, 242, 254, 0.25)', 'rgba(0, 242, 254, 0)');
                 ctx.restore();
             });
         }
-        
-        // Second Draw: Points Core
+
         renderOrder.forEach(i => {
             const item = items[i];
-            if (item.removed) return; // already deleted from the label files
-            const [px, py, pz] = projectedCoords[i];
-            const sx = px * viewZoom + viewPanX;
-            const sy = py * viewZoom + viewPanY;
-            
-            if (sx < -10 || sx > width + 10 || sy < -10 || sy > height + 10) return;
-            
-            const color = pointColor(item);
-            
-            let depthFactor = 1.0;
-            if (is3D && maxZ > minZ) {
-                depthFactor = 0.4 + 0.8 * ((pz - minZ) / (maxZ - minZ));
-            }
-            
+            const [sx, sy, z, r] = projCache[i];
+            if (sx < -12 || sx > width + 12 || sy < -12 || sy > height + 12) return;
             ctx.save();
-            if (is3D && !item.curDeleted) {
-                ctx.globalAlpha = Math.max(0.15, depthFactor);
-            }
-            
+            if (is3D && !item.curDeleted) ctx.globalAlpha = Math.max(0.3, 0.35 + 0.65 * depthOf(z));
             ctx.beginPath();
-            
             if (item.curDeleted) {
-                // Render excluded items as small faded gray crosses
                 ctx.strokeStyle = 'rgba(244, 63, 94, 0.7)';
                 ctx.lineWidth = 1.5;
-                const size = 4 * depthFactor;
-                ctx.moveTo(sx - size, sy - size);
-                ctx.lineTo(sx + size, sy + size);
-                ctx.moveTo(sx + size, sy - size);
-                ctx.lineTo(sx - size, sy + size);
+                const size = Math.max(3, r * 0.8);
+                ctx.moveTo(sx - size, sy - size); ctx.lineTo(sx + size, sy + size);
+                ctx.moveTo(sx + size, sy - size); ctx.lineTo(sx - size, sy + size);
                 ctx.stroke();
             } else {
-                // Active points
-                const isSelected = selectedIndex === i;
-                const isHovered = hoveredIndex === i;
-                
-                let radius = 5 * depthFactor;
-                if (isHovered) radius = 8 * depthFactor;
-                if (isSelected) radius = 9 * depthFactor;
-                
-                ctx.arc(sx, sy, radius, 0, Math.PI * 2);
-                ctx.fillStyle = color;
+                ctx.arc(sx, sy, r, 0, Math.PI * 2);
+                ctx.fillStyle = pointColor(item);
                 ctx.fill();
-                
-                // Active outline borders
-                if (isSelected) {
-                    ctx.strokeStyle = '#ffffff';
-                    ctx.lineWidth = 2.5;
-                    ctx.stroke();
-                    
-                    // Outer accent ring
-                    ctx.beginPath();
-                    ctx.arc(sx, sy, radius + 4 * depthFactor, 0, Math.PI * 2);
-                    ctx.strokeStyle = color;
-                    ctx.lineWidth = 1;
-                    ctx.stroke();
-                } else if (isHovered) {
-                    ctx.strokeStyle = '#ffffff';
-                    ctx.lineWidth = 1.5;
-                    ctx.stroke();
-                } else {
-                    ctx.strokeStyle = 'rgba(0, 0, 0, 0.4)';
-                    ctx.lineWidth = 1;
-                    ctx.stroke();
-                }
-                // Review decision mark: green ring = approved, amber square = relabeled
+                ctx.strokeStyle = 'rgba(0, 0, 0, 0.4)';
+                ctx.lineWidth = 1;
+                ctx.stroke();
                 if (relabeledLabels.has(item.id)) {
-                    const q = radius + 3;
-                    ctx.strokeStyle = '#f59e0b';
-                    ctx.lineWidth = 2;
+                    const q = r + 3;
+                    ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2;
                     ctx.strokeRect(sx - q, sy - q, q * 2, q * 2);
                 } else if (item.curKept) {
-                    ctx.beginPath();
-                    ctx.arc(sx, sy, radius + 3, 0, Math.PI * 2);
-                    ctx.strokeStyle = '#10b981';
-                    ctx.lineWidth = 2;
-                    ctx.stroke();
+                    ctx.beginPath(); ctx.arc(sx, sy, r + 3, 0, Math.PI * 2);
+                    ctx.strokeStyle = '#10b981'; ctx.lineWidth = 2; ctx.stroke();
                 }
             }
-            
             ctx.restore();
         });
-        
-        // Map selection rings + lasso path
+
+        // Selected / pinned / hovered points last, on top of everything, so they are always visible
+        [[selectedIndex, 'sel'], [pointPopupIdx, 'sel'], [hoveredIndex, 'hov']].forEach(([i, kind]) => {
+            if (i < 0 || i >= N || !projCache[i] || items[i].curDeleted) return;
+            const [sx, sy, , r] = projCache[i];
+            const R = Math.max(r, 5);
+            ctx.save();
+            ctx.beginPath(); ctx.arc(sx, sy, R + (kind === 'hov' ? 2 : 3), 0, Math.PI * 2);
+            ctx.fillStyle = pointColor(items[i]); ctx.fill();
+            ctx.strokeStyle = themeColors.ring; ctx.lineWidth = kind === 'hov' ? 2 : 2.5; ctx.stroke();
+            ctx.beginPath(); ctx.arc(sx, sy, R + (kind === 'hov' ? 7 : 9), 0, Math.PI * 2);
+            ctx.strokeStyle = kind === 'hov' ? '#fde047' : pointColor(items[i]); ctx.lineWidth = 1.5; ctx.stroke();
+            ctx.restore();
+        });
+
         if (lassoSel.size) {
             ctx.save();
             ctx.strokeStyle = '#fde047';
             ctx.lineWidth = 2;
             lassoSel.forEach(i => {
-                if (!projectedCoords[i] || items[i].curDeleted) return;
-                const sx = projectedCoords[i][0] * viewZoom + viewPanX;
-                const sy = projectedCoords[i][1] * viewZoom + viewPanY;
+                if (!projCache[i] || items[i].curDeleted) return;
                 ctx.beginPath();
-                ctx.arc(sx, sy, 8, 0, Math.PI * 2);
+                ctx.arc(projCache[i][0], projCache[i][1], projCache[i][3] + 4, 0, Math.PI * 2);
                 ctx.stroke();
             });
             ctx.restore();
@@ -1169,17 +1265,104 @@
             ctx.restore();
         }
 
-        // Third Draw: Tooltip Overlay (Top Layer)
-        if (hoveredIndex >= 0 && hoveredIndex < N) {
-            const item = items[hoveredIndex];
-            if (!item.curDeleted) {
-                const [px, py] = projectedCoords[hoveredIndex];
-                const sx = px * viewZoom + viewPanX;
-                const sy = py * viewZoom + viewPanY;
-                updateHoverPreview(sx, sy, item);
-            }
+        if (hoveredIndex >= 0 && hoveredIndex < N && projCache[hoveredIndex] && !items[hoveredIndex].curDeleted && hoveredIndex !== pointPopupIdx) {
+            const [sx, sy] = lastMouse || projCache[hoveredIndex];
+            updateHoverPreview(sx, sy, items[hoveredIndex]);
+        } else {
+            updateHoverPreview(0, 0, null);
         }
-        if (hoveredIndex < 0 || hoveredIndex >= N || items[hoveredIndex].curDeleted) updateHoverPreview(0, 0, null);
+        drawGizmo();
+    }
+
+    // nearest point under the cursor; in 3D the one closest to the camera wins (it is drawn on top)
+    function pickAt(mx, my) {
+        let best = -1, bestZ = -Infinity, bestD = Infinity;
+        const items = reportData ? reportData.items : [];
+        for (let i = 0; i < projCache.length; i++) {
+            const p = projCache[i];
+            if (!p || items[i].curDeleted) continue;
+            const d = Math.hypot(mx - p[0], my - p[1]);
+            if (d > p[3] + 4) continue;
+            if (is3D) {
+                if (p[2] > bestZ + 1e-9 || (Math.abs(p[2] - bestZ) <= 1e-9 && d < bestD)) { best = i; bestZ = p[2]; bestD = d; }
+            } else if (d < bestD) { best = i; bestD = d; }
+        }
+        return best;
+    }
+
+    // ---- orientation gizmo (3D): click an axis end or a Front/Top/Side button ----
+    const GIZMO_AXES = [['X', [1, 0, 0], '#f87171', 'side'], ['Y', [0, 1, 0], '#4ade80', 'top'], ['Z', [0, 0, 1], '#60a5fa', 'front']];
+    function gizmoProject(v) {
+        const [x, y, z] = v;
+        const cosY = Math.cos(rotationY), sinY = Math.sin(rotationY), cosX = Math.cos(rotationX), sinX = Math.sin(rotationX);
+        const x1 = x * cosY - z * sinY, z1 = x * sinY + z * cosY;
+        return [x1, y * cosX - z1 * sinX, y * sinX + z1 * cosX];
+    }
+    function drawGizmo() {
+        const g = document.getElementById('gizmo');
+        if (!g) return;
+        g.classList.toggle('hidden', !is3D);
+        if (!is3D) return;
+        const gc = document.getElementById('gizmo-canvas');
+        const gx = gc.getContext('2d');
+        const S = 96;
+        if (gc.width !== S) { gc.width = S; gc.height = S; }
+        gx.clearRect(0, 0, S, S);
+        gx.fillStyle = themeColors.bg; gx.globalAlpha = 0.75;
+        gx.beginPath(); gx.arc(S / 2, S / 2, S / 2 - 2, 0, Math.PI * 2); gx.fill(); gx.globalAlpha = 1;
+        const L = 22;
+        const corners = [];
+        for (const a of [-1, 1]) for (const b of [-1, 1]) for (const c of [-1, 1]) corners.push(gizmoProject([a * 0.6, b * 0.6, c * 0.6]));
+        gx.strokeStyle = themeColors.axis; gx.lineWidth = 1; gx.globalAlpha = 0.5;
+        [[0, 1], [0, 2], [0, 4], [1, 3], [1, 5], [2, 3], [2, 6], [3, 7], [4, 5], [4, 6], [5, 7], [6, 7]].forEach(([a, b]) => {
+            gx.beginPath(); gx.moveTo(S / 2 + corners[a][0] * L, S / 2 + corners[a][1] * L); gx.lineTo(S / 2 + corners[b][0] * L, S / 2 + corners[b][1] * L); gx.stroke();
+        });
+        gx.globalAlpha = 1;
+        const ends = GIZMO_AXES.map(([name, v, col, view]) => ({ name, col, view, p: gizmoProject(v) })).sort((a, b) => a.p[2] - b.p[2]);
+        ends.forEach(e => {
+            const x = S / 2 + e.p[0] * 34, y = S / 2 + e.p[1] * 34;
+            gx.strokeStyle = e.col; gx.lineWidth = 2;
+            gx.beginPath(); gx.moveTo(S / 2, S / 2); gx.lineTo(x, y); gx.stroke();
+            gx.fillStyle = e.col; gx.beginPath(); gx.arc(x, y, 8, 0, Math.PI * 2); gx.fill();
+            gx.fillStyle = '#0b0f14'; gx.font = '700 10px sans-serif'; gx.textAlign = 'center'; gx.textBaseline = 'middle';
+            gx.fillText(e.name, x, y + 0.5);
+        });
+        gc._ends = ends.map(e => ({ view: e.view, x: S / 2 + e.p[0] * 34, y: S / 2 + e.p[1] * 34 })).reverse();  // front-most first
+    }
+
+    const VIEWS = { front: [0, 0], top: [-Math.PI / 2, 0], side: [0, Math.PI / 2] };
+    let viewAnim = null;
+    function snapView(name) {
+        const target = VIEWS[name];
+        if (!target || !is3D) return;
+        cancelAnimationFrame(viewAnim);
+        setAutoRotate(false);
+        const from = [rotationX, rotationY];
+        const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));  // take the short way round
+        const d = [wrap(target[0] - from[0]), wrap(target[1] - from[1])];
+        const t0 = performance.now();
+        const step = now => {
+            const t = Math.min(1, (now - t0) / 350), e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+            rotationX = from[0] + d[0] * e; rotationY = from[1] + d[1] * e;
+            drawCanvas();
+            if (t < 1) viewAnim = requestAnimationFrame(step);
+        };
+        viewAnim = requestAnimationFrame(step);
+        plotCard.dataset.view = name;
+    }
+
+    let autoRotFrame = null;
+    function setAutoRotate(on) {
+        autoRotate = on;
+        const btn = document.getElementById('btn-plot-autorotate');
+        if (btn) btn.classList.toggle('active', on);
+        cancelAnimationFrame(autoRotFrame);
+        const tick = () => {
+            if (!autoRotate) return;
+            if (is3D && !isDrawing && !isPanning && activeTab === 'overview') { rotationY += 0.004; drawCanvas(); }
+            autoRotFrame = requestAnimationFrame(tick);
+        };
+        if (on) autoRotFrame = requestAnimationFrame(tick);
     }
 
     function itemFlags(item) {
@@ -1317,16 +1500,20 @@
     // ==========================================================================
     
     function setupCanvas() {
-        // Drag to Pan or Rotate
+        readThemeColors();
+        const mousePos = e => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+        canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+        // left-drag: rotate (3D) / pan (2D) · right-drag or ctrl-drag: pan · shift-drag: lasso (2D and 3D)
         canvas.addEventListener('mousedown', (e) => {
-            if (e.shiftKey && !is3D) {  // shift+drag = lasso select (2D map)
-                const r = canvas.getBoundingClientRect();
-                lassoPts = [[e.clientX - r.left, e.clientY - r.top]];
+            if (e.button === 0 && e.shiftKey) {
+                lassoPts = [mousePos(e)];
                 if (!(e.ctrlKey || e.metaKey)) lassoSel.clear();
-                closePointPopup();
                 e.preventDefault();
                 return;
             }
+            if (e.button !== 0 && e.button !== 2) return;
+            isPanning = e.button === 2 || e.ctrlKey || e.metaKey || !is3D;
             isDrawing = true;
             dragStart.x = e.clientX;
             dragStart.y = e.clientY;
@@ -1334,13 +1521,12 @@
             dragPanStart.y = viewPanY;
             dragRotationStart.x = rotationX;
             dragRotationStart.y = rotationY;
+            canvas.classList.add(isPanning ? 'grabbing' : 'rotating');
+            e.preventDefault();
         });
-        
+
         window.addEventListener('mousemove', (e) => {
-            const rect = canvas.getBoundingClientRect();
-            const mouseX = e.clientX - rect.left;
-            const mouseY = e.clientY - rect.top;
-            
+            const [mouseX, mouseY] = mousePos(e);
             if (lassoPts) {
                 lassoPts.push([mouseX, mouseY]);
                 drawCanvas();
@@ -1349,49 +1535,25 @@
             if (isDrawing) {
                 const dx = e.clientX - dragStart.x;
                 const dy = e.clientY - dragStart.y;
-                if (is3D) {
-                    // Update 3D rotation based on mouse movement
+                if (!isPanning) {
                     rotationY = dragRotationStart.y + dx * 0.007;
                     rotationX = dragRotationStart.x + dy * 0.007;
                 } else {
-                    // Calculate Panned offset
                     viewPanX = dragPanStart.x + dx;
                     viewPanY = dragPanStart.y + dy;
                 }
                 drawCanvas();
-            } else {
-                // Hover detection
-                if (pcaCoordinates.length === 0) return;
-                
-                let prevHovered = hoveredIndex;
-                hoveredIndex = -1;
-                
-                let minDist = 10; // Click radius
-                
-                pcaCoordinates.forEach((_, idx) => {
-                    const item = reportData.items[idx];
-                    if (item.curDeleted) return; // Ignore hovered excluded
-                    
-                    const [px, py] = getProjectedCoord(idx);
-                    const sx = px * viewZoom + viewPanX;
-                    const sy = py * viewZoom + viewPanY;
-                    
-                    const dx = mouseX - sx;
-                    const dy = mouseY - sy;
-                    const dist = Math.sqrt(dx * dx + dy * dy);
-                    
-                    if (dist < minDist) {
-                        minDist = dist;
-                        hoveredIndex = idx;
-                    }
-                });
-                
-                if (hoveredIndex !== prevHovered) {
-                    drawCanvas();
-                }
+                return;
             }
+            if (!reportData || e.target !== canvas) return;
+            lastMouse = [mouseX, mouseY];
+            const prev = hoveredIndex;
+            hoveredIndex = pickAt(mouseX, mouseY);
+            canvas.style.cursor = hoveredIndex >= 0 ? 'pointer' : '';
+            if (hoveredIndex !== prev) drawCanvas();
+            else if (hoveredIndex >= 0 && hoveredIndex !== pointPopupIdx) updateHoverPreview(mouseX, mouseY, reportData.items[hoveredIndex]);
         });
-        
+
         window.addEventListener('mouseup', (e) => {
             if (lassoPts) {
                 finishLasso();
@@ -1400,83 +1562,72 @@
             }
             if (isDrawing) lastDragDist = Math.hypot(e.clientX - dragStart.x, e.clientY - dragStart.y);
             isDrawing = false;
+            isPanning = false;
+            canvas.classList.remove('grabbing', 'rotating');
         });
-        
-        // Scroll Wheel to Zoom
+
+        // wheel: zoom toward the cursor (2D and 3D)
         canvas.addEventListener('wheel', (e) => {
             e.preventDefault();
-            
-            const rect = canvas.getBoundingClientRect();
-            const mouseX = e.clientX - rect.left;
-            const mouseY = e.clientY - rect.top;
-            
-            // Calculate mouse position relative to data space before zoom
-            const [dataX, dataY] = is3D ? [0, 0] : [
-                (mouseX - viewPanX) / viewZoom,
-                (mouseY - viewPanY) / viewZoom
-            ];
-            
-            const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
-            viewZoom = Math.max(0.1, Math.min(50, viewZoom * zoomFactor));
-            
-            if (!is3D) {
-                // Reposition pan so mouse point remains static
-                viewPanX = mouseX - dataX * viewZoom;
-                viewPanY = mouseY - dataY * viewZoom;
-            }
-            
+            const [mouseX, mouseY] = mousePos(e);
+            const dataX = (mouseX - viewPanX) / viewZoom;
+            const dataY = (mouseY - viewPanY) / viewZoom;
+            const zoomFactor = Math.exp(-Math.max(-100, Math.min(100, e.deltaY)) * 0.0015);
+            viewZoom = Math.max(fitZoom * 0.2, Math.min(fitZoom * 200, viewZoom * zoomFactor));
+            viewPanX = mouseX - dataX * viewZoom;
+            viewPanY = mouseY - dataY * viewZoom;
             drawCanvas();
         }, { passive: false });
-        
-        // Canvas Toolbar Controls
+
+        // double-click: centre (and orbit around, in 3D) the point under the cursor
+        canvas.addEventListener('dblclick', (e) => {
+            const [mx, my] = mousePos(e);
+            const i = pickAt(mx, my);
+            if (i >= 0) centreOnPoint(i, 1.6);
+        });
+
         document.getElementById('btn-plot-reset').addEventListener('click', () => {
-            if (is3D) {
-                rotationX = -0.5;
-                rotationY = 0.6;
-            }
+            if (is3D) { rotationX = -0.5; rotationY = 0.6; }
             resetCanvasView();
         });
-        
+
         document.getElementById('btn-plot-toggle-flags').addEventListener('click', (e) => {
             showAnomalyRings = !showAnomalyRings;
-            e.target.classList.toggle('active', showAnomalyRings);
+            e.currentTarget.classList.toggle('active', showAnomalyRings);
             drawCanvas();
         });
-        
-        // 3D Mode Toggle Listener
-        document.getElementById('btn-plot-toggle-3d').addEventListener('click', (e) => {
-            is3D = !is3D;
-            e.currentTarget.classList.toggle('active', is3D);
-            closePointPopup();
-            
-            const cardTitle = document.getElementById('plot-card-title');
-            const instructions = document.getElementById('plot-instructions');
-            
-            if (is3D) {
-                cardTitle.innerHTML = '<i class="fa-solid fa-cube"></i> Interactive 3D Embedding Space (PCA Projection)';
-                instructions.innerHTML = '<i class="fa-solid fa-arrows-spin"></i> Drag to rotate | <i class="fa-solid fa-magnifying-glass-plus"></i> Scroll to zoom | Click point to inspect';
-            } else {
-                cardTitle.innerHTML = '<i class="fa-solid fa-circle-nodes"></i> Interactive 2D Embedding Space (t-SNE)';
-                instructions.innerHTML = '<i class="fa-solid fa-arrows-up-down-left-right"></i> Drag to pan | <i class="fa-solid fa-magnifying-glass-plus"></i> Scroll to zoom | Click point to inspect | Shift+drag to select';
-            }
-            
-            resetCanvasView();
+
+        document.getElementById('btn-plot-toggle-3d').addEventListener('click', () => setPlotMode(!is3D));
+        document.getElementById('btn-plot-autorotate').addEventListener('click', () => {
+            if (!is3D) setPlotMode(true);
+            setAutoRotate(!autoRotate);
         });
-        
-        // Click to Select item
+
+        // gizmo: buttons + clicking an axis end
+        document.querySelectorAll('#gizmo [data-view]').forEach(b => b.addEventListener('click', () => snapView(b.dataset.view)));
+        document.getElementById('gizmo-canvas').addEventListener('click', e => {
+            const gc = e.currentTarget, r = gc.getBoundingClientRect();
+            const x = (e.clientX - r.left) * gc.width / r.width, y = (e.clientY - r.top) * gc.height / r.height;
+            const hit = (gc._ends || []).find(p => Math.hypot(p.x - x, p.y - y) < 12);
+            if (hit) snapView(hit.view);
+        });
+
+        // click: pick fresh at the click position (not a stale hover), open the pinned window
         canvas.addEventListener('click', (e) => {
-            if (suppressClick) { suppressClick = false; return; }  // end of a lasso
-            if (lastDragDist > 3) { lastDragDist = 0; return; }   // it was a pan / rotation drag
-            if (hoveredIndex >= 0) {
-                selectedIndex = hoveredIndex;
-                openPointPopup(hoveredIndex);
+            if (suppressClick) { suppressClick = false; return; }
+            if (lastDragDist > 4) { lastDragDist = 0; return; }
+            const [mx, my] = mousePos(e);
+            const i = pickAt(mx, my);
+            if (i >= 0) {
+                hoveredIndex = i;
+                selectedIndex = i;
+                openPointPopup(i);
                 drawCanvas();
-            } else {
-                closePointPopup();
             }
         });
 
         canvas.addEventListener('mouseleave', () => {
+            lastMouse = null;
             if (hoveredIndex >= 0 && !isDrawing) { hoveredIndex = -1; drawCanvas(); }
         });
 
@@ -1492,11 +1643,41 @@
         });
         setupPointModal();
         setupSelectionBar();
-        // click anywhere outside the small popup closes it (canvas clicks are handled by the canvas)
-        document.addEventListener('mousedown', e => {
-            const pop = document.getElementById('point-pop');
-            if (pointPopupIdx >= 0 && pop && !pop.contains(e.target) && e.target !== canvas) closePointPopup();
-        });
+        setupPopupDrag();
+    }
+
+    function setPlotMode(threeD) {
+        is3D = threeD;
+        if (!is3D) setAutoRotate(false);
+        document.getElementById('btn-plot-toggle-3d').classList.toggle('active', is3D);
+        document.getElementById('btn-plot-toggle-3d').innerHTML = is3D ? '<i class="fa-solid fa-map"></i> 2D map' : '<i class="fa-solid fa-cube"></i> 3D view';
+        plotCard.classList.toggle('is-3d', is3D);
+        const cardTitle = document.getElementById('plot-card-title');
+        const instructions = document.getElementById('plot-instructions');
+        if (is3D) {
+            cardTitle.innerHTML = '<i class="fa-solid fa-cube"></i> 3D view (PCA: X/Y/Z = first 3 components)';
+            instructions.innerHTML = 'Drag: rotate · Right/Ctrl-drag: pan · Wheel: zoom at cursor · Double-click: centre · Shift-drag: select · ?: help';
+        } else {
+            cardTitle.innerHTML = '<i class="fa-solid fa-circle-nodes"></i> Similarity map (2D, t-SNE)';
+            instructions.innerHTML = 'Drag: pan · Wheel: zoom at cursor · Double-click: centre · Click: inspect · Shift-drag: select · ?: help';
+        }
+        resetCanvasView();
+    }
+
+    function centreOnPoint(i, zoomBy = 1) {
+        const W = canvas.clientWidth, H = canvas.clientHeight;
+        if (is3D) {
+            const c = pcaCoordinates[i];
+            orbitCenter = [c[0], c[1], c[2] || 0];
+            viewZoom = Math.min(fitZoom * 200, viewZoom * zoomBy);
+            viewPanX = W / 2; viewPanY = H / 2;     // the orbit centre projects to (0, 0)
+        } else {
+            viewZoom = Math.min(fitZoom * 200, viewZoom * zoomBy);
+            const [px, py] = getProjectedCoord(i);
+            viewPanX = W / 2 - px * viewZoom;
+            viewPanY = H / 2 - py * viewZoom;
+        }
+        drawCanvas();
     }
 
     // ==========================================================================
@@ -1549,7 +1730,6 @@
         const cur = () => reportData && reportData.items[pointModalIdx];
         document.getElementById('pm-approve').onclick = () => {
             const it = cur(); if (!it) return;
-            if (it.curDeleted) deletedIds.delete(it.id);
             approveCrop(it.id, `Confirmed '${it.curLabel}' from the similarity map.`);
             refreshPointModal();
         };
@@ -1804,20 +1984,23 @@
         // Same rules as cluster_summary() in the Python backend, but on the current (reviewed) labels
         const groups = new Map();
         reportData.items.forEach(it => {
-            if (it.curDeleted || it.cluster === null || it.cluster === undefined) return;
+            if (it.curDeleted || it.removed || it.cluster === null || it.cluster === undefined) return;
             if (!groups.has(it.cluster)) groups.set(it.cluster, []);
             groups.get(it.cluster).push(it);
         });
         return [...groups.entries()].sort((a, b) => a[0] - b[0]).map(([c, g]) => {
             const counts = {};
             g.forEach(it => { counts[it.curLabel] = (counts[it.curLabel] || 0) + 1; });
-            const [major, nMajor] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+            const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+            const [major, nMajor] = sorted[0];
             const purity = nMajor / g.length;
             const unusual = g.filter(it => it.lof >= lofThreshold).length / g.length;
             const hint = purity < 0.7 ? 'mixed: check labels'
                 : unusual >= 0.3 ? 'many unusual boxes: background-like?'
                 : purity < 0.9 ? 'check the minority boxes' : 'clean';
-            return { cluster: c, size: g.length, major, purity, hint };
+            const second = sorted[1] ? `, ${Math.round(100 * sorted[1][1] / g.length)}% ${sorted[1][0]}` : '';
+            const name = `C${c}: ${purity >= 0.999 ? 'all' : 'mostly'} ${major}${second} – ${hint === 'clean' ? 'ok' : 'check'}`;
+            return { cluster: c, size: g.length, major, purity, hint, name };
         });
     }
 
@@ -1830,17 +2013,134 @@
             btn.innerHTML = `<i class="fa-solid fa-palette"></i> Color: ${colorBy}`;
         }
         if (colorBy === 'cluster' && hasClusters()) {
-            el.innerHTML = clusterSummary().map(s => `<div class="legend-item cluster-legend" title="${esc(s.hint)}">
-                <div class="legend-dot" style="background-color:${clusterColor(s.cluster)};"></div>
-                <span>C${s.cluster} · ${s.size} · ${esc(s.major)} ${Math.round(s.purity * 100)}% · <i class="${s.hint === 'clean' ? 'hint-ok' : 'hint-warn'}">${esc(s.hint)}</i></span></div>`).join('');
+            el.innerHTML = clusterSummary().map(s => `<button class="legend-item cluster-legend ${clusterFilter === s.cluster ? 'active' : ''}" data-cluster="${s.cluster}" title="${esc(s.hint)} · click to show only this cluster">
+                <span class="legend-dot" style="background-color:${clusterColor(s.cluster)};"></span>
+                <span>${esc(s.name)} · ${s.size}</span></button>`).join('') +
+                (clusterFilter !== null ? '<button class="legend-item legend-all" data-cluster="all">Show all clusters</button>' : '');
+            el.querySelectorAll('[data-cluster]').forEach(b => b.onclick = () => {
+                const c = b.dataset.cluster;
+                setClusterFilter(c === 'all' || +c === clusterFilter ? null : +c);
+            });
         } else {
             el.innerHTML = Object.entries(classColors).map(([cls, color]) =>
-                `<div class="legend-item"><div class="legend-dot" style="background-color:${color};"></div><span>${esc(cls)}</span></div>`).join('');
+                `<button class="legend-item ${gFilter.cls === cls ? 'active' : ''}" data-cls="${esc(cls)}" title="Click to show only this class"><span class="legend-dot" style="background-color:${color};"></span><span>${esc(cls)}</span></button>`).join('');
+            el.querySelectorAll('[data-cls]').forEach(b => b.onclick = () => {
+                gFilter.cls = gFilter.cls === b.dataset.cls ? '' : b.dataset.cls;
+                document.getElementById('gf-class').value = gFilter.cls;
+                applyFilters();
+            });
         }
     }
 
+    function setClusterFilter(c) {
+        clusterFilter = c;
+        renderPlotLegend();
+        renderClusterGrid();
+        drawCanvas();
+        updateFsSide();
+    }
+
+    function renderClusterGrid() {
+        const box = document.getElementById('cluster-grid');
+        if (!box || !reportData) return;
+        if (clusterFilter === null) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+        const s = clusterSummary().find(x => x.cluster === clusterFilter);
+        const items = reportData.items.filter(isVisible);
+        box.innerHTML = `<div class="cg-head"><b>${esc(s ? s.name : `C${clusterFilter}`)}</b> · ${items.length} boxes shown
+                <button class="btn btn-small" id="cg-close"><i class="fa-solid fa-xmark"></i> Show all</button></div>
+            <div class="cg-grid">${items.slice(0, 300).map(it => {
+                const dec = itemDecision(it);
+                return `<button class="cg-thumb ${isFlagged(it) ? 'flag' : ''}" data-idx="${it.index}" title="${esc(it.curLabel)}${dec ? ' · ' + esc(dec[0]) : ''}">
+                    <img loading="lazy" src="${esc(it.path)}" alt=""><span>${esc(it.curLabel)}</span>${dec ? `<i style="background:${dec[1]}"></i>` : ''}</button>`;
+            }).join('')}</div>${items.length > 300 ? '<p class="meter-desc">First 300 shown.</p>' : ''}`;
+        box.classList.remove('hidden');
+        box.querySelector('#cg-close').onclick = () => setClusterFilter(null);
+        box.querySelectorAll('.cg-thumb').forEach(b => b.onclick = () => { selectedIndex = +b.dataset.idx; openPointPopup(+b.dataset.idx); drawCanvas(); });
+    }
+
     // ==========================================================================
-    // LASSO SELECTION ON THE 2D MAP
+    // GLOBAL FILTERS, STATUS, NEXT PROBLEM
+    // ==========================================================================
+
+    // Flagged at the current thresholds, whether or not it has been reviewed yet
+    const isFlagged = it => !!(it.is_mislabeled || it.is_outlier || it.has_issue || it.is_duplicate
+        || (it.issues && it.issues.length) || it.lof >= lofThreshold
+        || (it.pred && it.pred !== (it.relabeled_from || it.label) && (it.pred_conf || 0) >= mislabelConf));
+
+    function passesFilter(it) {
+        if (gFilter.cls && it.curLabel !== gFilter.cls) return false;
+        if (gFilter.cam && it.camera !== gFilter.cam) return false;
+        if (gFilter.period && it.period !== gFilter.period) return false;
+        if (gFilter.flagged && !isFlagged(it)) return false;
+        if (gFilter.unreviewed && itemDecision(it)) return false;
+        return true;
+    }
+
+    function applyFilters() {
+        gFilter.cls = document.getElementById('gf-class').value;
+        gFilter.cam = document.getElementById('gf-camera').value;
+        gFilter.period = document.getElementById('gf-period').value;
+        gFilter.flagged = document.getElementById('gf-flagged').checked;
+        gFilter.unreviewed = document.getElementById('gf-unreviewed').checked;
+        const n = reportData ? reportData.items.filter(isVisible).length : 0;
+        document.getElementById('gf-count').textContent = reportData ? `${n} shown` : '';
+        recomputeCuration();
+        renderPlotLegend();
+    }
+
+    function reviewCounts() {
+        const flagged = reportData.items.filter(it => !it.removed && isFlagged(it));
+        const done = flagged.filter(it => itemDecision(it)).length;
+        return { total: flagged.length, done, left: flagged.length - done };
+    }
+
+    function updateTopStatus() {
+        const el = document.getElementById('top-status');
+        if (!el || !reportData) return;
+        const c = reviewCounts();
+        el.innerHTML = `<span class="ts-name" title="${esc(reportData.dataset_dir || '')}">${esc(reportData.dataset_name || 'Dataset')}</span>
+            <span class="ts-pill">Reviewed <b>${c.done}</b>/${c.total}</span>
+            <span class="ts-pill ${c.left ? 'warn' : 'ok'}"><b>${c.left}</b> left to review</span>`;
+        const gc = document.getElementById('gf-count');
+        if (gc) gc.textContent = `${reportData.items.filter(isVisible).length} shown`;
+    }
+
+    function nextProblem() {
+        if (!reportData) return;
+        const items = reportData.items;
+        const ok = it => !it.removed && !it.curDeleted && isFlagged(it) && !itemDecision(it) && isVisible(it);
+        const start = pointPopupIdx >= 0 ? pointPopupIdx : selectedIndex;
+        let found = -1;
+        for (let k = 1; k <= items.length; k++) {
+            const i = ((start < 0 ? -1 : start) + k + items.length) % items.length;
+            if (ok(items[i])) { found = i; break; }
+        }
+        if (found < 0) { showToast('No unreviewed problems left with the current filters.'); return; }
+        if (activeTab !== 'overview') switchTab('overview');
+        selectedIndex = found;
+        centreOnPoint(found, 1);
+        openPointPopup(found);
+    }
+
+    function updateFsSide() {
+        const el = document.getElementById('fs-side');
+        if (!el || !reportData) return;
+        const c = reviewCounts();
+        const it = reportData.items[pointPopupIdx >= 0 ? pointPopupIdx : selectedIndex];
+        const filters = [gFilter.cls, gFilter.cam, gFilter.period, gFilter.flagged && 'flagged', gFilter.unreviewed && 'unreviewed', clusterFilter !== null && `C${clusterFilter}`].filter(Boolean);
+        el.innerHTML = `<h4>${esc(reportData.dataset_name || 'Dataset')}</h4>
+            <div class="fs-row">Reviewed <b>${c.done}</b>/${c.total} · <b>${c.left}</b> left</div>
+            <div class="fs-row">Showing <b>${reportData.items.filter(isVisible).length}</b> boxes${filters.length ? ` · filter: ${filters.map(esc).join(', ')}` : ''}</div>
+            <button class="btn btn-primary btn-big" id="fs-next"><i class="fa-solid fa-forward"></i> Next problem</button>
+            ${it ? `<div class="fs-item"><img src="${esc(it.path)}" alt=""><div>${pill(it.curLabel)} ${it.pred ? `model: <b>${esc(it.pred)}</b> ${pct(it.pred_conf)}` : ''}</div>
+                <div>${it.cluster !== null && it.cluster !== undefined ? `Cluster C${it.cluster} · ` : ''}${esc(it.camera || '')} · ${esc(it.period || '')}</div>
+                <div class="pp-hint">What to do: ${esc(pointHint(it))}</div></div>` : '<p class="meter-desc">Click a point to see it here.</p>'}
+            <p class="meter-desc">Keys: N next problem · ←/→ prev/next · Esc close · ? help</p>`;
+        el.querySelector('#fs-next').onclick = nextProblem;
+    }
+
+    // ==========================================================================
+    // LASSO SELECTION (2D and 3D: uses the projected screen positions)
     // ==========================================================================
 
     function pointInPolygon(x, y, poly) {
@@ -1864,9 +2164,9 @@
             const shape = area || rect;
             if (w > 3 || h > 3) {
                 reportData.items.forEach((it, i) => {
-                    if (it.curDeleted) return;
-                    const [px, py] = getProjectedCoord(i);
-                    if (pointInPolygon(px * viewZoom + viewPanX, py * viewZoom + viewPanY, shape)) lassoSel.add(i);
+                    const p = projCache[i];
+                    if (!p || it.curDeleted || !isVisible(it)) return;
+                    if (pointInPolygon(p[0], p[1], shape)) lassoSel.add(i);
                 });
             }
         }
@@ -1894,6 +2194,7 @@
 
     function bulkDecide(kind, newLabel) {
         const ids = [];
+        const snap = takeSnap([...lassoSel].map(i => reportData.items[i] && reportData.items[i].id).filter(Boolean));
         lassoSel.forEach(i => {
             const it = reportData.items[i];
             if (!it || it.removed) return;
@@ -1913,6 +2214,7 @@
         lassoSel.clear();
         recomputeCuration();
         updateSelectionBar();
+        if (ids.length) showToast(`${ids.length} boxes ${kind === 'approve' ? 'approved' : kind === 'remove' ? 'marked for removal' : `relabeled to ${newLabel}`}.`, snap);
     }
 
     function setupSelectionBar() {
@@ -1925,41 +2227,64 @@
         document.getElementById('btn-plot-color').addEventListener('click', () => {
             if (!hasClusters()) return;
             colorBy = colorBy === 'class' ? 'cluster' : 'class';
+            if (colorBy === 'class' && clusterFilter !== null) clusterFilter = null;
             renderPlotLegend();
+            renderClusterGrid();
             drawCanvas();
         });
     }
 
     // ==========================================================================
-    // SMALL POINT POPUP (click on the map)
+    // PINNED POINT WINDOW (click on the map): draggable, crop + full frame, prev/next
     // ==========================================================================
 
     let pointPopupIdx = -1;
 
     function pointHint(it) {
         if (it.curDeleted) return 'Marked for removal. Undo to keep it.';
-        if (relabeledLabels.has(it.id)) return `Relabeled ${it.label} → ${it.curLabel}.`;
-        if (it.curKept) return 'Approved.';
-        if (it.is_mislabeled) return `Model thinks ${it.pred} (${pct(it.pred_conf)}): relabel?`;
-        if (it.has_issue) return `${it.issues[0]}: fix or remove.`;
-        if (it.is_outlier) return 'Unusual box: check or remove.';
-        if (it.is_duplicate) return 'Near-duplicate of another box: consider removing one.';
+        if (relabeledLabels.has(it.id)) return `Relabeled ${it.label} → ${it.curLabel}. Nothing else to do.`;
+        if (it.curKept) return 'Approved. Nothing else to do.';
+        if (it.is_mislabeled) return `Model thinks ${it.pred} (${pct(it.pred_conf)}): relabel to ${it.pred} if it is one, else approve.`;
+        if (it.has_issue) return `${it.issues[0]}: remove the bad box.`;
+        if (it.is_outlier) return 'Unusual box: approve if it is a real ' + it.curLabel + ', else remove.';
+        if (it.is_duplicate) return 'Near-duplicate of another box: remove one copy.';
         return 'Looks fine: approve or skip.';
+    }
+
+    function popNavList() {
+        const cur = reportData.items[pointPopupIdx];
+        let list = reportData.items.filter(it => isVisible(it) && !it.removed);
+        if (popNavMode === 'flagged') list = list.filter(it => isFlagged(it) && (!itemDecision(it) || it === cur));
+        else if (cur && cur.cluster !== null && cur.cluster !== undefined) list = list.filter(it => it.cluster === cur.cluster);
+        return list.map(it => it.index);
+    }
+
+    function popStep(d) {
+        const list = popNavList();
+        if (!list.length) return;
+        let pos = list.indexOf(pointPopupIdx);
+        if (pos < 0) pos = d > 0 ? -1 : 0;
+        const next = list[(pos + d + list.length) % list.length];
+        selectedIndex = next;
+        openPointPopup(next);
+        drawCanvas();
     }
 
     function openPointPopup(idx) {
         const it = reportData.items[idx];
         if (!it) return;
+        const wasOpen = pointPopupIdx >= 0;
         pointPopupIdx = idx;
         updateHoverPreview(0, 0, null);
         const pop = document.getElementById('point-pop');
-        const [px, py] = getProjectedCoord(idx);
-        const sx = px * viewZoom + viewPanX, sy = py * viewZoom + viewPanY;
-        const W = canvas.clientWidth, H = canvas.clientHeight, PW = 240, PH = 300;
-        pop.style.left = `${Math.max(8, Math.min(sx + 14 + PW > W ? sx - PW - 14 : sx + 14, W - PW - 8))}px`;
-        pop.style.top = `${Math.max(8, Math.min(sy - 40, H - PH - 8))}px`;
+        if (!wasOpen && !popPos) {
+            const W = canvas.clientWidth, PW = Math.min(560, W - 16);
+            pop.style.left = `${Math.max(8, W - PW - 12)}px`;
+            pop.style.top = '12px';
+        }
         refreshPointPopup();
         pop.classList.remove('hidden');
+        updateFsSide();
     }
 
     function refreshPointPopup() {
@@ -1968,29 +2293,52 @@
         const pop = document.getElementById('point-pop');
         const others = classNames.filter(c => c !== it.curLabel);
         const def = it.pred && it.pred !== it.curLabel ? it.pred : others[0];
+        const list = popNavList();
+        const pos = list.indexOf(pointPopupIdx);
+        const dec = itemDecision(it);
         pop.innerHTML = `
-            <button class="pp-close" title="Close (Esc)">×</button>
-            <img src="${esc(it.path)}" alt="">
-            <div class="pp-line">${pill(it.curLabel)} <span>model: <b>${esc(it.pred || 'n/a')}</b> ${it.pred ? pct(it.pred_conf) : ''}</span></div>
-            <div class="pp-line">${it.cluster !== null && it.cluster !== undefined ? `cluster <b>C${it.cluster}</b> · ` : ''}${esc(it.split)} · LOF ${it.lof.toFixed(2)}</div>
-            <div class="pp-hint">${esc(pointHint(it))}</div>
-            <div class="pp-actions">
-                <button class="btn btn-small pp-ok" data-pp="approve" title="Approve"><i class="fa-solid fa-check"></i></button>
-                <button class="btn btn-small pp-del" data-pp="remove" title="Remove box"><i class="fa-solid fa-trash"></i></button>
-                <select class="pp-select">${others.map(c => `<option value="${esc(c)}" ${c === def ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
-                <button class="btn btn-small" data-pp="relabel" title="Relabel">Relabel</button>
-                ${itemDecision(it) ? '<button class="btn btn-small" data-pp="undo" title="Undo decision"><i class="fa-solid fa-rotate-left"></i></button>' : ''}
+            <div class="pp-head" title="Drag to move">
+                <i class="fa-solid fa-grip-vertical"></i>
+                <span class="pp-title">${esc(it.image)}</span>
+                <button class="pp-close" title="Close (Esc)">×</button>
             </div>
-            <a href="#" class="pp-full">view full image</a>`;
+            <div class="pp-nav">
+                <button class="btn btn-small" data-nav="-1" title="Previous (←)"><i class="fa-solid fa-chevron-left"></i></button>
+                <span>${pos >= 0 ? pos + 1 : '–'} / ${list.length}</span>
+                <button class="btn btn-small" data-nav="1" title="Next (→)"><i class="fa-solid fa-chevron-right"></i></button>
+                <select class="pp-mode" title="What prev/next walks through">
+                    <option value="cluster" ${popNavMode === 'cluster' ? 'selected' : ''}>same cluster</option>
+                    <option value="flagged" ${popNavMode === 'flagged' ? 'selected' : ''}>flagged, unreviewed</option>
+                </select>
+            </div>
+            <div class="pp-imgs">
+                <figure><img class="pp-crop" src="${esc(it.path)}" alt="crop"><figcaption>Box</figcaption></figure>
+                <figure class="pp-frame-fig"><div class="pp-frame-wrap"><img class="pp-frame" src="/api/frame?id=${encodeURIComponent(it.id)}" alt="frame"></div><figcaption>Full frame</figcaption></figure>
+            </div>
+            <div class="pp-line">Label ${pill(it.curLabel)} <span>Model guess: <b>${esc(it.pred || 'n/a')}</b> ${it.pred ? pct(it.pred_conf) : ''}</span></div>
+            <div class="pp-line">${it.cluster !== null && it.cluster !== undefined ? `Cluster <b>C${it.cluster}</b> · ` : ''}${esc(it.split)} · ${esc(it.camera || '')} · ${esc(it.period || '')}${dec ? ` · <b style="color:${dec[1]}">${esc(dec[0])}</b>` : ''}</div>
+            <div class="pp-hint"><b>What to do:</b> ${esc(pointHint(it))}</div>
+            <div class="pp-actions">
+                <button class="btn pp-ok" data-pp="approve" title="Approve"><i class="fa-solid fa-check"></i> Approve</button>
+                <button class="btn pp-del" data-pp="remove" title="Remove box"><i class="fa-solid fa-trash"></i> Remove</button>
+                <select class="pp-select">${others.map(c => `<option value="${esc(c)}" ${c === def ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+                <button class="btn" data-pp="relabel" title="Relabel">Relabel</button>
+                <button class="btn" data-pp="undo" title="Undo decision" ${dec ? '' : 'disabled'}><i class="fa-solid fa-rotate-left"></i> Undo</button>
+            </div>`;
+        const frame = pop.querySelector('.pp-frame');
+        frame.onerror = () => { pop.querySelector('.pp-frame-fig').innerHTML = '<p class="meter-desc">Full frame needs the CleanCrop server.</p>'; };
         pop.querySelector('.pp-close').onclick = closePointPopup;
-        pop.querySelector('.pp-full').onclick = ev => { ev.preventDefault(); const i = pointPopupIdx; closePointPopup(); openPointModal(i); };
+        pop.querySelector('.pp-mode').onchange = e => { popNavMode = e.target.value; refreshPointPopup(); };
+        pop.querySelectorAll('[data-nav]').forEach(b => b.onclick = () => popStep(+b.dataset.nav));
+        pop.querySelector('.pp-frame-wrap').onclick = () => openFrame(it.id);
         pop.querySelectorAll('[data-pp]').forEach(b => b.onclick = () => {
             const act = b.dataset.pp;
-            if (act === 'approve') { if (it.curDeleted) deletedIds.delete(it.id); reviewUndo.push([it.id]); approveCrop(it.id, `Confirmed '${it.curLabel}' from the similarity map.`); }
+            if (act === 'approve') { reviewUndo.push([it.id]); approveCrop(it.id, `Confirmed '${it.curLabel}' from the similarity map.`); }
             else if (act === 'remove') { reviewUndo.push([it.id]); excludeCrop(it.id, 'Deleted box from the similarity map.'); }
             else if (act === 'relabel') { const nl = pop.querySelector('.pp-select').value; if (nl && nl !== it.curLabel) { reviewUndo.push([it.id]); relabelCrop(it.id, it.curLabel, nl); } }
             else if (act === 'undo') undoCrop(it.id);
             refreshPointPopup();
+            updateFsSide();
         });
     }
 
@@ -1998,6 +2346,144 @@
         const pop = document.getElementById('point-pop');
         if (pop) pop.classList.add('hidden');
         pointPopupIdx = -1;
+        updateFsSide();
+        drawCanvas();
+    }
+
+    function setupPopupDrag() {
+        const pop = document.getElementById('point-pop');
+        let start = null;
+        pop.addEventListener('mousedown', e => {
+            if (!e.target.closest('.pp-head') || e.target.closest('button')) return;
+            start = [e.clientX, e.clientY, pop.offsetLeft, pop.offsetTop];
+            e.preventDefault();
+        });
+        window.addEventListener('mousemove', e => {
+            if (!start) return;
+            const host = pop.offsetParent || document.body;
+            const x = Math.max(0, Math.min(host.clientWidth - 60, start[2] + e.clientX - start[0]));
+            const y = Math.max(0, Math.min(host.clientHeight - 30, start[3] + e.clientY - start[1]));
+            pop.style.left = `${x}px`; pop.style.top = `${y}px`;
+            popPos = [x, y];
+        });
+        window.addEventListener('mouseup', () => { start = null; });
+    }
+
+    // ==========================================================================
+    // TRAINING READY PAGE
+    // ==========================================================================
+
+    function renderReadyTab() {
+        const el = document.getElementById('ready-content');
+        if (!el) return;
+        const c = reviewCounts();
+        const nBg = (reportData.backgrounds || []).length;
+        const nImg = reportData.stats ? reportData.stats.images : 0;
+        const bgPct = nImg ? 100 * nBg / nImg : 0;
+        const golden = reportData.golden_test ? reportData.golden_test.images : 0;
+        const pending = deletedIds.size + relabeledLabels.size;
+        const checks = [
+            [c.left === 0, `All flagged boxes reviewed (${c.done}/${c.total})`, c.left ? `${c.left} still to review: use Next problem.` : 'Done.'],
+            [bgPct >= 5 && bgPct <= 15, `Backgrounds ${bgPct.toFixed(1)}% (${nBg} images)`, 'Aim for about 5–15% images with no boxes.'],
+            [golden > 0, `Golden test set: ${golden} images`, golden ? 'Kept out of training as the fixed test split.' : 'None yet: run the analysis with --golden-split 0.15.'],
+            [(reportData.summary.issue_count || 0) === 0 || reviewCounts().left === 0, `Broken / double boxes: ${reportData.summary.issue_count || 0}`, 'Fix or remove them before training.'],
+            [true, `${pending} pending changes (${deletedIds.size} removals, ${relabeledLabels.size} relabels)`, 'The export applies them to a copy; the original dataset is not touched.'],
+        ];
+        el.innerHTML = `
+            <div class="ready-stats">
+                <div class="ready-stat"><div class="rs-num">${bgPct.toFixed(1)}%</div><div>background images</div></div>
+                <div class="ready-stat ${c.left ? 'warn' : 'ok'}"><div class="rs-num">${c.left}</div><div>unreviewed flags</div></div>
+                <div class="ready-stat"><div class="rs-num">${golden}</div><div>golden test images</div></div>
+            </div>
+            <div class="ready-checks">${checks.map(([ok, t, why]) => `<div class="readiness-row"><span class="st ${ok ? 'pass' : 'warn'}">${ok ? 'OK' : 'CHECK'}</span><div><div>${esc(t)}</div><div class="why">${esc(why)}</div></div></div>`).join('')}</div>
+            <button class="btn btn-primary btn-big" id="btn-export-clean" ${serverAvailable ? '' : 'disabled title="Needs the CleanCrop server"'}><i class="fa-solid fa-box-archive"></i> Export clean dataset</button>
+            <div id="export-clean-result" class="meter-desc">Writes a new folder <code>clean_export_&lt;time&gt;</code> next to the report. Nothing in the source dataset changes.</div>`;
+        el.querySelector('#btn-export-clean').onclick = exportCleanDataset;
+    }
+
+    async function flushState() {
+        clearTimeout(saveTimer);
+        await fetch('/api/state', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                deleted: [...deletedIds], relabeled: Object.fromEntries(relabeledLabels), kept: [...keptIds],
+                ignoredDuplicates: [...ignoredDuplicates], log: actionsLog,
+                thresholds: { dup: dupThreshold, lof: lofThreshold, mis: mislabelConf },
+            }),
+        });
+    }
+
+    async function exportCleanDataset() {
+        const btn = document.getElementById('btn-export-clean');
+        const out = document.getElementById('export-clean-result');
+        btn.disabled = true;
+        out.textContent = 'Exporting…';
+        try {
+            await flushState();
+            const r = await fetch('/api/export_clean', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+            const j = await r.json();
+            if (!r.ok || j.status !== 'ok') throw new Error(j.message || `HTTP ${r.status}`);
+            out.innerHTML = `<b>Exported</b> to <code>${esc(j.out_dir)}</code>` +
+                Object.entries(j).filter(([k, v]) => !['status', 'out_dir'].includes(k) && typeof v !== 'object').map(([k, v]) => ` · ${esc(k)}: ${esc(String(v))}`).join('');
+            showToast('Clean dataset exported.');
+        } catch (e) {
+            out.innerHTML = `<span class="hint-warn">Export failed: ${esc(e.message)}</span>`;
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    // ==========================================================================
+    // EXTRAS: filters bar, theme, help overlay, keys
+    // ==========================================================================
+
+    function setTheme(t) {
+        document.documentElement.dataset.theme = t;
+        try { localStorage.setItem('cc-theme', t); } catch (e) { /* storage blocked */ }
+        const b = document.getElementById('btn-theme');
+        if (b) b.innerHTML = t === 'light' ? '<i class="fa-solid fa-moon"></i>' : '<i class="fa-solid fa-sun"></i>';
+        readThemeColors();
+        drawCanvas();
+    }
+
+    function toggleHelp(show) {
+        const h = document.getElementById('help-overlay');
+        const on = show === undefined ? h.classList.contains('hidden') : show;
+        const host = document.fullscreenElement || document.body;
+        if (h.parentElement !== host) host.appendChild(h);
+        h.classList.toggle('hidden', !on);
+    }
+
+    function setupUiExtras() {
+        let theme = 'dark';
+        try { theme = localStorage.getItem('cc-theme') || 'dark'; } catch (e) { /* storage blocked */ }
+        setTheme(theme);
+        document.getElementById('btn-theme').onclick = () => setTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+        ['gf-class', 'gf-camera', 'gf-period', 'gf-flagged', 'gf-unreviewed'].forEach(id => document.getElementById(id).addEventListener('change', applyFilters));
+        document.getElementById('gf-reset').onclick = () => {
+            ['gf-class', 'gf-camera', 'gf-period'].forEach(id => { document.getElementById(id).value = ''; });
+            document.getElementById('gf-flagged').checked = false;
+            document.getElementById('gf-unreviewed').checked = false;
+            clusterFilter = null;
+            applyFilters();
+        };
+        document.getElementById('btn-next-problem').onclick = nextProblem;
+        document.getElementById('btn-help').onclick = () => toggleHelp();
+        document.getElementById('help-overlay').addEventListener('click', e => { if (e.target.id === 'help-overlay' || e.target.closest('.help-close')) toggleHelp(false); });
+        document.addEventListener('keydown', e => {
+            if (e.target instanceof Element && e.target.matches('input, select, textarea')) return;
+            const help = !document.getElementById('help-overlay').classList.contains('hidden');
+            if (help && e.key === 'Escape') { toggleHelp(false); e.stopImmediatePropagation(); e.preventDefault(); return; }
+            if (e.ctrlKey || e.metaKey || e.altKey) return;
+            if (e.key === '?') { toggleHelp(); e.preventDefault(); return; }
+            const modalOpen = !document.getElementById('frame-modal').classList.contains('hidden')
+                || !document.getElementById('point-modal').classList.contains('hidden');
+            if (modalOpen || (activeTab !== 'overview' && activeTab !== 'explorer')) return;
+            if (e.key.toLowerCase() === 'n') { nextProblem(); e.preventDefault(); e.stopImmediatePropagation(); return; }
+            if (pointPopupIdx >= 0 && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
+                popStep(e.key === 'ArrowRight' ? 1 : -1); e.preventDefault(); e.stopImmediatePropagation();
+            }
+        }, true);
     }
 
     // --- Audit file export ---

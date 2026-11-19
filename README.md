@@ -42,14 +42,21 @@ Every crop is shown with surrounding context and the box outline. **Click any cr
 full image** with all of its boxes drawn — essential for small objects.
 
 ### Similarity map (Overview)
-Hover a point to preview the crop, label, model guess and flags. Click it for a small window next to the point
-(crop, label, model guess, cluster, a one-line hint, **Approve / Remove / Relabel**; Esc or click elsewhere closes it);
-its *view full image* link opens the full image with **Open in editor**. **Shift+drag** on the 2D map draws a lasso
-(a short straight drag = box select; Ctrl+Shift adds to the selection) and a bar lets you approve / remove / relabel
-all selected boxes at once. **Color: class / cluster** colours points by k-means cluster (k chosen by silhouette,
-2-12); the legend then lists each cluster's size, majority class, purity and a hint (e.g. *mixed: check labels*). Points with a decision are
-marked (green ring = approved, amber square = relabeled, red cross = removed). **Full screen** button or `F`
-(Esc to leave) works in 2D and 3D.
+- **2D** (t-SNE) and **3D** (PCA, labelled X/Y/Z axes, floor grid, depth-sized points). In 3D: drag = rotate,
+  right-drag or Ctrl-drag = pan, wheel = zoom toward the cursor, double-click = centre/orbit on a point,
+  orientation gizmo (click an axis or **Front / Top / Side**), **Auto-rotate**. Picking is depth-aware (the point
+  nearest the camera wins) and the hovered point is highlighted.
+- **Hover** shows the crop in a card by the cursor. **Click** pins a draggable window: crop + full frame (with its box),
+  label, model guess, cluster, a *What to do* line, **Approve / Remove / Relabel / Undo**, and prev/next through the
+  same cluster or the flagged-unreviewed list (arrow keys too). Esc closes it.
+- **Shift+drag** = lasso (2D and 3D), then approve / remove / relabel all selected boxes.
+- **Color: cluster** names each cluster (e.g. *C3: mostly pigeon, 12% dog – check*) and draws its outline on the
+  2D map; click a cluster in the legend to show only it plus a grid of its images.
+- Top bar: dataset name, **reviewed X/Y**, left to review, filters (class, camera, day/night, flagged only,
+  unreviewed only; they apply to the map and the grids), **Next problem** (`N`), dark/light theme, `?` shortcut help.
+  Every decision shows a toast with **Undo**. **Full screen** (`F`) keeps a side panel with status and the current box.
+- **Training ready?** tab: background %, unreviewed flags, golden test size, a checklist and **Export clean dataset**
+  (writes `curation_output/<name>/clean_export_<time>/` via `export_clean`; the source dataset is not touched).
 
 ### Keyboard review (Suspected Mislabels and Unusual Boxes tabs)
 `A` (or `K`) approve · `X`/`Del` remove box · `1`-`9` relabel to class N · `R` accept suggested class (mislabels) ·

@@ -56,6 +56,9 @@
                 <button class="menu-item" data-tab="distribution">
                     <i class="fa-solid fa-chart-simple"></i> <span>Distribution</span>
                 </button>
+                <button class="menu-item" data-tab="ready">
+                    <i class="fa-solid fa-flag-checkered"></i> <span>Training ready?</span>
+                </button>
             </nav>
 
             <div class="sidebar-footer">
@@ -73,6 +76,23 @@
 
         <!-- Main Content Area -->
         <main class="main-content">
+            <div class="status-bar" id="status-bar">
+                <div class="top-status" id="top-status"></div>
+                <div class="global-filters" id="global-filters">
+                    <select id="gf-class" title="Class"><option value="">All classes</option></select>
+                    <select id="gf-camera" title="Camera"><option value="">All cameras</option></select>
+                    <select id="gf-period" title="Day / night"><option value="">Day + night</option></select>
+                    <label class="chk"><input type="checkbox" id="gf-flagged"> Flagged only</label>
+                    <label class="chk"><input type="checkbox" id="gf-unreviewed"> Unreviewed only</label>
+                    <button class="btn btn-small" id="gf-reset" title="Clear filters">Clear</button>
+                    <span class="gf-count" id="gf-count"></span>
+                </div>
+                <div class="status-actions">
+                    <button class="btn btn-primary" id="btn-next-problem" title="Jump to the next unreviewed flagged box (N)"><i class="fa-solid fa-forward"></i> Next problem</button>
+                    <button class="btn btn-secondary icon-btn" id="btn-theme" title="Dark / light theme"><i class="fa-solid fa-sun"></i></button>
+                    <button class="btn btn-secondary icon-btn" id="btn-help" title="Keyboard shortcuts (?)">?</button>
+                </div>
+            </div>
             <header class="top-nav">
                 <div class="nav-title">
                     <h2 id="current-tab-title">Overview</h2>
@@ -171,10 +191,20 @@
                                 <div class="plot-controls">
                                     <button id="btn-plot-toggle-3d" title="Toggle 2D/3D Mode"><i class="fa-solid fa-cube"></i> 3D Mode</button>
                                     <button id="btn-plot-color" title="Colour points by class or by embedding cluster"><i class="fa-solid fa-palette"></i> Color: class</button>
+                                    <button id="btn-plot-autorotate" title="Spin the 3D view slowly"><i class="fa-solid fa-rotate"></i> Auto-rotate</button>
                                     <button id="btn-plot-reset" title="Reset View"><i class="fa-solid fa-arrows-rotate"></i></button>
                                     <button id="btn-plot-toggle-flags" class="active" title="Toggle flag halos"><i class="fa-solid fa-eye"></i> Flags</button>
                                     <button id="btn-plot-fullscreen" title="Full screen (F / Esc)"><i class="fa-solid fa-expand"></i> Full screen</button>
                                 </div>
+                                <div class="gizmo hidden" id="gizmo">
+                                    <canvas id="gizmo-canvas" width="96" height="96" title="Click an axis to look along it"></canvas>
+                                    <div class="gizmo-btns">
+                                        <button data-view="front" title="Front view (look along Z)">Front</button>
+                                        <button data-view="top" title="Top view (look along Y)">Top</button>
+                                        <button data-view="side" title="Side view (look along X)">Side</button>
+                                    </div>
+                                </div>
+                                <aside class="fs-side" id="fs-side"></aside>
                                 <div class="plot-hover hidden" id="plot-hover"></div>
                                 <div class="point-pop hidden" id="point-pop"></div>
                                 <div class="plot-selection hidden" id="plot-selection">
@@ -219,6 +249,7 @@
                             </div>
                         </div>
                     </div>
+                    <div class="card cluster-grid hidden" id="cluster-grid"></div>
                 </section>
 
                 <!-- TAB: NEAR-DUPLICATES -->
@@ -524,6 +555,14 @@
                     <div class="dist-grid" id="dist-grid"></div>
                 </section>
 
+                <!-- TAB: TRAINING READY -->
+                <section class="tab-pane" id="tab-ready">
+                    <div class="card">
+                        <div class="card-header"><div class="card-title"><i class="fa-solid fa-flag-checkered"></i> Training ready?</div></div>
+                        <div class="card-body" id="ready-content"></div>
+                    </div>
+                </section>
+
             </div>
         </main>
     </div>
@@ -568,6 +607,31 @@
                     </div>
                 </div>
             </div>
+        </div>
+    </div>
+
+    <!-- Toast after each action (with Undo) -->
+    <div class="toast hidden" id="toast" role="status"></div>
+
+    <!-- Keyboard help -->
+    <div class="help-overlay hidden" id="help-overlay">
+        <div class="help-box-panel card">
+            <div class="help-head"><b>Keyboard and mouse</b><button class="btn btn-small help-close" title="Close (Esc)">×</button></div>
+            <table class="help-table">
+                <tr><td><kbd>?</kbd></td><td>Show / hide this help</td></tr>
+                <tr><td><kbd>N</kbd></td><td>Next problem (next unreviewed flagged box)</td></tr>
+                <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>Previous / next box in the pinned window (same cluster or flagged list)</td></tr>
+                <tr><td><kbd>Esc</kbd></td><td>Close window / selection / full screen</td></tr>
+                <tr><td><kbd>F</kbd></td><td>Full screen map (Overview)</td></tr>
+                <tr><td><kbd>U</kbd></td><td>Undo last decision</td></tr>
+                <tr><td><kbd>A</kbd>/<kbd>K</kbd> · <kbd>X</kbd> · <kbd>R</kbd> · <kbd>1-9</kbd></td><td>Review lists: approve · remove · accept suggestion · relabel to class N</td></tr>
+                <tr><td>Drag</td><td>3D: rotate · 2D: pan</td></tr>
+                <tr><td>Right-drag / Ctrl-drag</td><td>Pan</td></tr>
+                <tr><td>Wheel</td><td>Zoom toward the cursor</td></tr>
+                <tr><td>Double-click</td><td>Centre on that point</td></tr>
+                <tr><td>Shift-drag</td><td>Lasso select (2D and 3D)</td></tr>
+                <tr><td>Hover / click</td><td>Preview card / pinned window with actions</td></tr>
+            </table>
         </div>
     </div>
 

@@ -168,3 +168,12 @@ def test_clustering_and_summary():
     assert all(s["majority"] == "person" for s in summ)
     # tiny input: one cluster, no sklearn needed
     assert dcy.cluster_embeddings(emb[:4])[1] == 1
+
+
+def test_export_clean_timestamped(dataset, tmp_path):
+    out = str(tmp_path / "curation")
+    _fake_analysis(dataset, out)
+    res = dcy.export_clean_timestamped(out)
+    assert res["status"] == "ok" and os.path.basename(res["out_dir"]).startswith("clean_export_")
+    assert os.path.dirname(res["out_dir"]) == os.path.abspath(out)
+    assert os.path.isfile(os.path.join(res["out_dir"], "data.yaml")) and res["images"] >= 1
