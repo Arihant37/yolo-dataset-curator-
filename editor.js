@@ -239,21 +239,23 @@
             e.preventDefault(); e.stopPropagation(); return;
         }
         const k = e.key.toLowerCase();
-        // Suspected Mislabels: A / D move through the list whatever has focus (a clicked dropdown or button keeps
-        // focus and app.js then ignores letter keys); R / K / X / F take focus back from a dropdown first.
-        if (activeTab() === 'mislabels' && !(e.target.matches && e.target.matches('input, textarea')) && !e.ctrlKey && !e.altKey && !e.metaKey) {
-            if (k === 'a' || k === 'd') {
+        // Suspected Mislabels: arrows / D move through the list whatever has focus (a clicked dropdown or button keeps
+        // focus and app.js then ignores letter keys); review keys (A K R X U F 1-9) take focus back from a dropdown first (also in Unusual Boxes).
+        const reviewTab = activeTab() === 'mislabels' || activeTab() === 'outliers';
+        if (reviewTab && !(e.target.matches && e.target.matches('input, textarea')) && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            const nav = activeTab() === 'mislabels' && (k === 'd' || k === 'arrowdown' || k === 'arrowup' || k === 'arrowright' || k === 'arrowleft');
+            if (nav) {
                 const cards = [...document.querySelectorAll('#mis-list-container .item-list-card')];
                 if (cards.length) {
                     let i = cards.findIndex(c => c.classList.contains('active'));
-                    i = i < 0 ? 0 : Math.max(0, Math.min(cards.length - 1, i + (k === 'd' ? 1 : -1)));
+                    i = i < 0 ? 0 : Math.max(0, Math.min(cards.length - 1, i + (k === 'd' || k === 'arrowdown' || k === 'arrowright' ? 1 : -1)));
                     if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
                     const fm = document.getElementById('frame-modal'); if (fm) fm.classList.add('hidden');
                     cards[i].click(); cards[i].scrollIntoView({ block: 'nearest' });
                 }
                 e.preventDefault(); e.stopPropagation(); return;
             }
-            if (['r', 'k', 'x', 'f', 'delete'].includes(k) && e.target.matches && e.target.matches('select, button')) {
+            if ((['r', 'k', 'x', 'a', 'u', 'f', 'delete'].includes(k) || /^[1-9]$/.test(k)) && e.target.matches && e.target.matches('select, button')) {
                 e.preventDefault(); e.stopPropagation(); e.target.blur();
                 document.dispatchEvent(new KeyboardEvent('keydown', { key: e.key, bubbles: true }));  // let app.js handle it
                 return;

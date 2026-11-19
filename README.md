@@ -42,13 +42,19 @@ Every crop is shown with surrounding context and the box outline. **Click any cr
 full image** with all of its boxes drawn — essential for small objects.
 
 ### Similarity map (Overview)
-Hover a point to preview the crop, label, model guess and flags. Click it to open the full image with the box
-drawn and **Approve / Remove / Relabel / Open in editor** (saved like the other tabs). Points with a decision are
+Hover a point to preview the crop, label, model guess and flags. Click it for a small window next to the point
+(crop, label, model guess, cluster, a one-line hint, **Approve / Remove / Relabel**; Esc or click elsewhere closes it);
+its *view full image* link opens the full image with **Open in editor**. **Shift+drag** on the 2D map draws a lasso
+(a short straight drag = box select; Ctrl+Shift adds to the selection) and a bar lets you approve / remove / relabel
+all selected boxes at once. **Color: class / cluster** colours points by k-means cluster (k chosen by silhouette,
+2-12); the legend then lists each cluster's size, majority class, purity and a hint (e.g. *mixed: check labels*). Points with a decision are
 marked (green ring = approved, amber square = relabeled, red cross = removed). **Full screen** button or `F`
 (Esc to leave) works in 2D and 3D.
 
-### Keyboard review (Suspected Mislabels tab)
-`R` accept suggested class · `K` label is correct · `D` delete box · `F` full image · `↑`/`↓` move.
+### Keyboard review (Suspected Mislabels and Unusual Boxes tabs)
+`A` (or `K`) approve · `X`/`Del` remove box · `1`-`9` relabel to class N · `R` accept suggested class (mislabels) ·
+arrows (or `D`) next / previous · `U` undo the last keyboard or map-selection decision · `F` full image.
+A counter shows **reviewed N / M** for the current thresholds.
 
 ### Sensitivity sliders
 Lower values flag more boxes. Start with the defaults; lower them once the obvious cases are fixed.
@@ -92,6 +98,7 @@ python dataset_curator_yolo.py C:\path\to\dataset --serve-only   # reopen dashbo
 | `--export-labeling` | | Copy flagged images + labels (YOLO `.txt` and X-AnyLabeling `.json`) into `for_labeling/` (menu option 4) |
 | `--sync-labels` | | Copy labels fixed in `for_labeling/` back into the dataset, with backups (menu option 5) |
 | `--export-folder` | | Save every flagged box as an annotated full image in `to_verify/` (also menu option 3 in `CleanCrop.bat`) |
+| `--export-clean OUT_DIR` | | Write a **ready-to-train** YOLO dataset to a new folder: review decisions applied (deleted boxes dropped, relabels applied, images in `review_state.json` `excluded_images` skipped), background images kept, and images in `golden_test.txt` (if present) put in a separate `test` split; writes `data.yaml`, `classes.txt`, `export_summary.json`. The source dataset is not changed |
 | `--port` | `8000` | Next free port is used if busy |
 
 Outputs in the output folder:
@@ -101,6 +108,13 @@ Outputs in the output folder:
 - `cache/` — embedding cache (delete to force a full recompute)
 
 The dashboard server only listens on `localhost`.
+
+### Tests
+
+```bash
+pip install pytest
+pytest tests -q      # tiny synthetic dataset, no embedding model needed
+```
 
 ---
 
@@ -116,7 +130,8 @@ Install the SDK: `pip install "mcp>=1.2"` (also in requirements.txt).
 Tools: `run_analysis` (background job) / `job_status`, `get_summary`, `list_flagged` (mislabel | outlier | duplicate | issue),
 `get_item`, `decide` (approve / exclude / relabel into `review_state.json`, shown by the dashboard),
 `relabel_box` / `remove_box` (edit the YOLO label file, backup in `curation_output/<name>/label_backups`),
-`export_for_labeling`, `sync_labels`, `get_distribution`, `open_dashboard`. All paths are absolute.
+`export_for_labeling`, `sync_labels`, `export_clean(dataset_dir, out_dir)` (ready-to-train copy, see `--export-clean`),
+`get_clusters`, `get_distribution`, `open_dashboard`. All paths are absolute.
 
 **Claude Code** (add `--scope user` to make it available in every project):
 

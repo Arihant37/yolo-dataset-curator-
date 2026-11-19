@@ -449,6 +449,61 @@ def pca_3d(emb):
     return coords
 
 
+def cluster_embeddings(emb, k_min=2, k_max=12, seed=0):
+    """k-means on L2-normalised embeddings (PCA to 50 dims), k chosen by silhouette (k_min..k_max).
+    Returns (cluster ids array, chosen k, silhouette). Small datasets get a single cluster."""
+    N = len(emb)
+    if N < max(10, k_min * 3):
+        return np.zeros(N, dtype=int), 1, None
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+    X = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-9)
+    if X.shape[1] > 50 and N > 50:
+        Xc = X - X.mean(axis=0)
+        _, _, vt = np.linalg.svd(Xc, full_matrices=False)
+        X = Xc @ vt[:50].T
+    best = (None, 1, -1.0)
+    sample = min(N, 3000)
+    for k in range(k_min, min(k_max, N - 1) + 1):
+        lab = KMeans(n_clusters=k, n_init=4, random_state=seed).fit_predict(X)
+        if len(set(lab)) < 2:
+            continue
+        sc = float(silhouette_score(X, lab, sample_size=sample, random_state=seed))
+        if sc > best[2]:
+            best = (lab, k, sc)
+    if best[0] is None:
+        return np.zeros(N, dtype=int), 1, None
+    return best[0].astype(int), best[1], round(best[2], 4)
+
+
+def cluster_summary(items, lof_threshold=1.5):
+    """Per cluster: size, majority class, purity, share of unusual boxes and a review hint."""
+    groups = defaultdict(list)
+    for it in items:
+        if it.get("cluster") is not None and not it.get("removed"):
+            groups[it["cluster"]].append(it)
+    out = []
+    for c in sorted(groups):
+        g = groups[c]
+        counts = defaultdict(int)
+        for it in g:
+            counts[it["label"]] += 1
+        major, n_major = max(counts.items(), key=lambda kv: kv[1])
+        purity = n_major / len(g)
+        unusual = sum(1 for it in g if (it.get("lof") or 0) >= lof_threshold) / len(g)
+        if purity < 0.7:
+            hint = "mixed classes: check labels"
+        elif unusual >= 0.3:
+            hint = "many unusual boxes: background-like or bad crops?"
+        elif purity < 0.9:
+            hint = "mostly one class: check the minority boxes"
+        else:
+            hint = "clean"
+        out.append({"cluster": int(c), "size": len(g), "majority": major, "purity": round(purity, 3),
+                    "unusual": round(unusual, 3), "classes": dict(counts), "hint": hint})
+    return out
+
+
 def tsne_2d(emb):
     """2D similarity map: PCA to 50 dims, then t-SNE (cosine). Falls back to PCA if it fails."""
     N = len(emb)
@@ -486,6 +541,12 @@ def analyze(boxes, emb, class_names, args, stats, problems, dataset_dir):
     coords = pca_3d(emb) if N >= 3 else np.zeros((N, 3))
     print("Building 2D similarity map (t-SNE)...")
     map2d = tsne_2d(emb) if N >= 5 else coords[:, :2]
+    print("Clustering embeddings (k-means, k by silhouette)...")
+    try:
+        clusters, n_clusters, silhouette = cluster_embeddings(emb)
+    except Exception as e:  # clustering is a convenience; never fail the analysis for it
+        print(f"  clustering failed ({e}); skipped")
+        clusters, n_clusters, silhouette = None, 0, None
 
     items = []
     for i, b in enumerate(boxes):
@@ -511,6 +572,7 @@ def analyze(boxes, emb, class_names, args, stats, problems, dataset_dir):
             "nbrs": [[int(j), round(float(s), 4)] for j, s in zip(nbr_idx[i], nbr_sim[i])],
             "pca": [round(float(v), 4) for v in coords[i]],
             "map2d": [round(float(v), 4) for v in map2d[i]],
+            "cluster": None if clusters is None else int(clusters[i]),
         })
 
     backgrounds = stats.pop("backgrounds", [])
@@ -547,6 +609,8 @@ def analyze(boxes, emb, class_names, args, stats, problems, dataset_dir):
         "backgrounds": backgrounds,
         "distribution": dist,
         "golden_test": golden,
+        "clusters": {"k": n_clusters, "silhouette": silhouette,
+                     "summary": cluster_summary(items, args.lof_threshold) if clusters is not None else []},
     }
 
 
@@ -1695,6 +1759,149 @@ def sync_labels_back(output_dir):
 
 
 # ==========================================================================
+# "READY TO TRAIN" EXPORT
+# ==========================================================================
+
+def _parse_box_line(line):
+    """'cls xc yc w h' -> (cls, [xc, yc, w, h]) or None if the line is not a usable box."""
+    parts = line.split()
+    if len(parts) < 5:
+        return None
+    try:
+        c = int(float(parts[0]))
+        bb = [float(p) for p in parts[1:5]]
+    except ValueError:
+        return None
+    if bb[2] <= 0 or bb[3] <= 0:
+        return None
+    return c, bb
+
+
+def export_clean(output_dir, out_dir):
+    """
+    Writes a new YOLO dataset to out_dir with the review decisions applied (the source dataset is not touched):
+    boxes marked deleted are dropped, relabels applied, images listed in review_state "excluded_images" skipped,
+    background images kept, and images in golden_test.txt (if present) moved to a separate 'test' split.
+    """
+    output_dir, out_dir = os.path.abspath(output_dir), os.path.abspath(out_dir)
+    with open(os.path.join(output_dir, "curation_report.json"), "r", encoding="utf-8") as f:
+        report = json.load(f)
+    dataset_dir = os.path.abspath(report["dataset_dir"])
+    names = report["class_names"]
+    nc = lambda p: os.path.normcase(os.path.abspath(p))
+    if nc(out_dir) == nc(dataset_dir) or nc(out_dir).startswith(nc(dataset_dir) + os.sep):
+        raise SystemExit("--export-clean OUT_DIR must be outside the source dataset folder.")
+    if os.path.isdir(out_dir) and os.listdir(out_dir):
+        raise SystemExit(f"{out_dir} is not empty; choose a new folder.")
+
+    state = {}
+    state_path = os.path.join(output_dir, "review_state.json")
+    if os.path.exists(state_path):
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f) or {}
+    deleted = set(state.get("deleted") or [])
+    relabeled = {k: v for k, v in (state.get("relabeled") or {}).items() if v in names}
+    excluded = set()
+    for p in state.get("excluded_images") or state.get("excludedImages") or []:
+        excluded.add(nc(p) if os.path.isabs(p) else p.replace("\\", "/"))
+    golden = set()
+    gpath = os.path.join(output_dir, "golden_test.txt")
+    if os.path.exists(gpath):
+        with open(gpath, "r", encoding="utf-8") as f:
+            golden = {nc(line.strip()) for line in f if line.strip()}
+
+    items_by_label = defaultdict(list)
+    for it in report["items"]:
+        if not it.get("removed"):
+            items_by_label[nc(it["label_path"])].append(it)
+
+    def match(items, n, c, bb):
+        for it in items:  # same line + same box first, then the nearest box of the same class
+            if it["line"] == n and max(abs(a - b) for a, b in zip(bb, it["bbox"])) < 1e-4:
+                return it
+        best, best_d = None, 1e-3
+        for it in items:
+            d = max(abs(a - b) for a, b in zip(bb, it["bbox"]))
+            if it["class_id"] == c and d < best_d:
+                best, best_d = it, d
+        return best
+
+    counts = {"images": 0, "boxes": 0, "backgrounds": 0, "dropped_boxes": 0, "relabeled_boxes": 0,
+              "skipped_images": 0, "test_images": 0, "bad_lines": 0}
+    per_split = defaultdict(int)
+    used_names = defaultdict(set)
+    for split, images_dir, labels_dir in find_splits(dataset_dir):
+        for img_file in sorted(f for f in os.listdir(images_dir) if f.lower().endswith(IMAGE_EXTS)):
+            img_path = os.path.join(images_dir, img_file)
+            key = nc(img_path)
+            if key in excluded or f"{split}/{img_file}" in excluded:
+                counts["skipped_images"] += 1
+                continue
+            base = os.path.splitext(img_file)[0]
+            label_path = os.path.join(labels_dir, base + ".txt")
+            lines_out = []
+            if os.path.exists(label_path):
+                items = items_by_label.get(nc(label_path), [])
+                with open(label_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                for n, line in enumerate(lines):
+                    if not line.strip():
+                        continue
+                    parsed = _parse_box_line(line)
+                    if parsed is None or not (0 <= parsed[0] < len(names)):
+                        counts["bad_lines"] += 1
+                        continue
+                    c, bb = parsed
+                    it = match(items, n, c, bb)
+                    if it is not None:
+                        if it["id"] in deleted:
+                            counts["dropped_boxes"] += 1
+                            continue
+                        if it["id"] in relabeled and names.index(relabeled[it["id"]]) != c:
+                            c = names.index(relabeled[it["id"]])
+                            counts["relabeled_boxes"] += 1
+                    lines_out.append(f"{c} {bb[0]:.6f} {bb[1]:.6f} {bb[2]:.6f} {bb[3]:.6f}\n")
+            out_split = "test" if key in golden else split
+            name = img_file
+            if name.lower() in used_names[out_split]:  # same file name from two source splits
+                name = f"{split}_{img_file}"
+            used_names[out_split].add(name.lower())
+            dst_img = os.path.join(out_dir, out_split, "images", name)
+            dst_lbl = os.path.join(out_dir, out_split, "labels", os.path.splitext(name)[0] + ".txt")
+            os.makedirs(os.path.dirname(dst_img), exist_ok=True)
+            os.makedirs(os.path.dirname(dst_lbl), exist_ok=True)
+            shutil.copy2(img_path, dst_img)
+            with open(dst_lbl, "w", encoding="utf-8") as f:
+                f.writelines(lines_out)
+            counts["images"] += 1
+            counts["boxes"] += len(lines_out)
+            counts["backgrounds"] += 0 if lines_out else 1
+            counts["test_images"] += int(out_split == "test")
+            per_split[out_split] += 1
+
+    splits = sorted(per_split)
+    os.makedirs(out_dir, exist_ok=True)
+    pick = lambda *cands: next((f"{c}/images" for c in cands if c in splits), None)
+    data = {"path": out_dir, "nc": len(names), "names": names}
+    data["train"] = pick("train", "all") or (f"{splits[0]}/images" if splits else None)
+    data["val"] = pick("valid", "val") or data["train"]
+    if "test" in splits:
+        data["test"] = "test/images"
+    with open(os.path.join(out_dir, "data.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+    with open(os.path.join(out_dir, "classes.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(names) + "\n")
+    summary = {"out_dir": out_dir, "source": dataset_dir, "golden_test": os.path.exists(gpath), **counts,
+               "splits": dict(per_split), "created": datetime.now().isoformat(timespec="seconds")}
+    with open(os.path.join(out_dir, "export_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print(f"Exported {counts['images']} images ({counts['backgrounds']} backgrounds, {counts['test_images']} test), "
+          f"{counts['boxes']} boxes; dropped {counts['dropped_boxes']}, relabeled {counts['relabeled_boxes']}, "
+          f"skipped {counts['skipped_images']} image(s) -> {out_dir}")
+    return summary
+
+
+# ==========================================================================
 # MAIN
 # ==========================================================================
 
@@ -1720,6 +1927,8 @@ def main():
     parser.add_argument("--sync-labels", action="store_true", help="Copy labels edited in <output>/for_labeling back into the dataset (with backups), then exit")
     parser.add_argument("--golden-split", type=float, default=None, metavar="FRAC",
                         help="Also write golden_test.txt: a stratified (camera x class x day/night), diverse ~FRAC of the images; near-duplicates stay together")
+    parser.add_argument("--export-clean", metavar="OUT_DIR", default=None,
+                        help="Write a ready-to-train YOLO dataset to OUT_DIR with the review decisions applied (golden_test.txt -> test split), then exit")
     parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)  # kept for old commands; serving is the default now
     args = parser.parse_args()
 
@@ -1730,6 +1939,12 @@ def main():
     if not os.path.isdir(dataset_dir):
         raise SystemExit(f"Dataset folder not found: {dataset_dir}")
     output_dir = os.path.abspath(args.output_dir or os.path.join(SCRIPT_DIR, "curation_output", os.path.basename(os.path.normpath(dataset_dir))))
+
+    if args.export_clean:
+        if not os.path.exists(os.path.join(output_dir, "curation_report.json")):
+            raise SystemExit(f"No analysis found in {output_dir}. Run the analysis first.")
+        export_clean(output_dir, args.export_clean.strip('"'))
+        return
 
     if args.export_folder or args.export_labeling or args.sync_labels:
         if not os.path.exists(os.path.join(output_dir, "curation_report.json")):

@@ -98,7 +98,7 @@ def _dup_pairs(report, p):
 
 def _brief(it, out_dir):
     return {"id": it["id"], "image": it.get("image"), "split": it.get("split"), "label": it.get("label"),
-            "pred": it.get("pred"), "conf": it.get("pred_conf"), "lof": it.get("lof"),
+            "pred": it.get("pred"), "conf": it.get("pred_conf"), "lof": it.get("lof"), "cluster": it.get("cluster"),
             "crop": os.path.normpath(os.path.join(out_dir, it["path"])) if it.get("path") else None}
 
 
@@ -348,6 +348,35 @@ def export_for_labeling(dataset_dir: str) -> str:
 def sync_labels(dataset_dir: str) -> str:
     """Copy labels edited in <output>/for_labeling back into the dataset (with backups)."""
     return _dumps(_run_cli([os.path.abspath(dataset_dir), "--sync-labels"]))
+
+
+@mcp.tool()
+def export_clean(dataset_dir: str, out_dir: str) -> str:
+    """Write a ready-to-train YOLO dataset to out_dir (must be a new/empty folder outside the dataset) with the
+    review_state.json decisions applied: deleted boxes dropped, relabels applied, excluded images skipped,
+    backgrounds kept, golden_test.txt images (if any) in a separate 'test' split. The source dataset is not changed."""
+    sys.path.insert(0, SCRIPT_DIR)
+    import dataset_curator_yolo as dcy
+    _report(dataset_dir)
+    try:
+        import contextlib
+        with contextlib.redirect_stdout(sys.stderr):  # stdout is the MCP stdio channel
+            return _dumps(dcy.export_clean(_out_dir(dataset_dir), out_dir))
+    except SystemExit as e:
+        return _dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_clusters(dataset_dir: str) -> str:
+    """Embedding clusters (k-means, k by silhouette): size, majority class, purity and a review hint per cluster."""
+    rep = _report(dataset_dir)
+    cl = rep.get("clusters")
+    if not cl:
+        return _dumps({"error": "No clusters in this report; re-run run_analysis."})
+    sys.path.insert(0, SCRIPT_DIR)
+    from dataset_curator_yolo import cluster_summary  # recompute: labels may have changed since the analysis
+    return _dumps({"k": cl.get("k"), "silhouette": cl.get("silhouette"),
+                   "summary": cluster_summary(rep["items"], _params(rep)["lof_threshold"])})
 
 
 @mcp.tool()

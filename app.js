@@ -63,6 +63,19 @@
 
     // Mislabel review cursor (position in mislabelList)
     let misCursor = -1;
+    // Unusual Boxes keyboard cursor (position in outlierList)
+    let outCursor = -1;
+    // Keyboard / map-selection undo stack: each entry is a list of crop ids decided together
+    const reviewUndo = [];
+    // "reviewed N / M" per review tab
+    const reviewProgress = { mislabels: [0, 0], outliers: [0, 0] };
+    // Point colouring: 'class' or 'cluster' (cluster ids come from the analysis)
+    let colorBy = 'class';
+    // Lasso selection on the 2D map (shift+drag)
+    let lassoPts = null;
+    const lassoSel = new Set();
+    let suppressClick = false;
+    let lastDragDist = 0;
 
     const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     const pct = v => (v === null || v === undefined) ? 'n/a' : `${(v * 100).toFixed(0)}%`;
@@ -237,6 +250,21 @@
             health_score: active.length ? ((active.length - flagged) / active.length) * 100 : 100,
         };
 
+        // Review progress: boxes flagged at the current thresholds, reviewed or not
+        const decided = it => deletedIds.has(it.id) || keptIds.has(it.id) || relabeledLabels.has(it.id) || !!it.relabeled_from;
+        let mR = 0, mT = 0, oR = 0, oT = 0;
+        items.forEach(it => {
+            if (it.removed) return;
+            const d = decided(it);
+            const wasMis = !!it.pred && it.pred !== (it.relabeled_from || it.label) && (it.pred_conf || 0) >= mislabelConf;
+            if (it.is_mislabeled) mT++;
+            else if (wasMis && d) { mT++; mR++; }
+            if (it.is_outlier) oT++;
+            else if (it.lof >= lofThreshold && d) { oT++; oR++; }
+        });
+        reviewProgress.mislabels = [mR, mT];
+        reviewProgress.outliers = [oR, oT];
+
         updateUI();
     }
 
@@ -270,8 +298,8 @@
 
     const TAB_TITLES = {
         overview: ["Overview", "Dataset health at a glance. Start with Suspected Mislabels, then Unusual Boxes."],
-        mislabels: ["Suspected Mislabels", "A classifier that never saw these boxes disagrees with their label. Keys: R = accept suggestion, K = label is correct, D = delete box, ↑/↓ = move, F = full frame."],
-        outliers: ["Unusual Boxes", "Boxes that look unlike the rest of their class: wrong object, bad crop, background, other species..."],
+        mislabels: ["Suspected Mislabels", "A classifier that never saw these boxes disagrees with their label. Keys: A/K = label is correct, X = delete box, R = accept suggestion, 1-9 = relabel to class N, arrows = move, U = undo, F = full frame."],
+        outliers: ["Unusual Boxes", "Boxes that look unlike the rest of their class: wrong object, bad crop, background, other species... Keys: A approve, X remove, 1-9 relabel, arrows move, U undo."],
         issues: ["Broken / Double Boxes", "Boxes annotated twice, conflicting labels on the same object, boxes outside the image or unknown class ids."],
         duplicates: ["Near-Duplicates", "Almost identical boxes from different images. Train↔val pairs are listed first: they inflate validation scores."],
         explorer: ["All Boxes", "Search, filter and review any box. Click a thumbnail to inspect it."],
@@ -291,6 +319,8 @@
         renderActiveTab();
         if (tabId === 'overview') resetCanvasView();
         if (tabId === 'mislabels' && mislabelList.length && misCursor < 0) selectMislabelItem(0);
+        if (tabId === 'outliers' && outlierList.length && outCursor < 0) selectOutlierCard(0);
+        if (tabId !== 'overview') closePointPopup();
     }
 
     function renderActiveTab() {
@@ -353,8 +383,7 @@
                 </div>`;
             }).join('');
 
-        document.getElementById('plot-legend').innerHTML = Object.entries(classColors).map(([cls, color]) =>
-            `<div class="legend-item"><div class="legend-dot" style="background-color:${color};"></div><span>${esc(cls)}</span></div>`).join('');
+        renderPlotLegend();
 
         // Dataset facts from the scan
         const st = reportData.stats || {};
@@ -443,7 +472,8 @@
         const list = kind === 'outliers' ? outlierList : issueList;
         const grid = document.getElementById(`${kind}-grid-container`);
         document.getElementById(`${kind}-stats`).textContent = `${list.length} boxes to review` +
-            (kind === 'outliers' ? ' (most unusual first)' : '');
+            (kind === 'outliers' ? ` (most unusual first) · reviewed ${reviewProgress.outliers[0]} / ${reviewProgress.outliers[1]}` +
+                ' · keys: A approve, X remove, 1-9 relabel, arrows move, U undo' : '');
 
         if (list.length === 0) {
             grid.innerHTML = `<div class="empty-state-msg" style="grid-column:1/-1;height:200px;">
@@ -453,11 +483,11 @@
             return;
         }
 
-        grid.innerHTML = list.slice(0, shown[kind]).map(it => {
+        grid.innerHTML = list.slice(0, shown[kind]).map((it, idx) => {
             const reason = kind === 'outliers'
                 ? `Unusual for '${esc(it.curLabel)}' (score ${it.lof.toFixed(2)})` + (it.pred && it.pred !== it.curLabel ? `<br>Model thinks: <b>${esc(it.pred)}</b> (${pct(it.pred_conf)})` : '')
                 : it.issues.map(esc).join('<br>');
-            return `<div class="outlier-card">
+            return `<div class="outlier-card${kind === 'outliers' && idx === outCursor ? ' kb-active' : ''}" data-idx="${idx}">
                 <div class="outlier-badge ${kind === 'issues' ? 'issue' : ''}">${kind === 'issues' ? 'BOX ISSUE' : 'UNUSUAL'}</div>
                 <div class="crop-image-wrapper">${thumb(it)}</div>
                 <span class="crop-id" title="${esc(it.image)}">${esc(it.id)} · ${esc(it.split)}</span>
@@ -478,12 +508,19 @@
             if (sel.value && it) relabelCrop(it.id, it.curLabel, sel.value);
         }));
         wireMoreButtons(grid);
+        if (kind === 'outliers') {
+            grid.querySelectorAll('.outlier-card').forEach(card => card.addEventListener('click', e => {
+                if (!e.target.closest('button, select, img')) selectOutlierCard(parseInt(card.dataset.idx));
+            }));
+            if (outCursor >= 0) selectOutlierCard(Math.min(outCursor, Math.min(list.length, shown.outliers) - 1));
+        }
     }
 
     // --- 5. MISLABELS ---
     function renderMislabelsTab() {
         const listContainer = document.getElementById('mis-list-container');
         document.getElementById('mis-items-title').textContent = `Suspected Wrong Labels (${mislabelList.length})`;
+        document.getElementById('mis-progress').textContent = `reviewed ${reviewProgress.mislabels[0]} / ${reviewProgress.mislabels[1]}`;
 
         if (mislabelList.length === 0) {
             listContainer.innerHTML = `<div class="empty-state-msg" style="height:100px;"><i class="fa-solid fa-circle-check" style="font-size:24px;color:var(--color-clean)"></i><p>No suspected mislabels at this confidence. Lower the slider to see borderline cases.</p></div>`;
@@ -1026,7 +1063,7 @@
             
             if (sx < -10 || sx > width + 10 || sy < -10 || sy > height + 10) return;
             
-            const color = classColors[item.curLabel] || defaultColor;
+            const color = pointColor(item);
             
             let depthFactor = 1.0;
             if (is3D && maxZ > minZ) {
@@ -1102,6 +1139,36 @@
             ctx.restore();
         });
         
+        // Map selection rings + lasso path
+        if (lassoSel.size) {
+            ctx.save();
+            ctx.strokeStyle = '#fde047';
+            ctx.lineWidth = 2;
+            lassoSel.forEach(i => {
+                if (!projectedCoords[i] || items[i].curDeleted) return;
+                const sx = projectedCoords[i][0] * viewZoom + viewPanX;
+                const sy = projectedCoords[i][1] * viewZoom + viewPanY;
+                ctx.beginPath();
+                ctx.arc(sx, sy, 8, 0, Math.PI * 2);
+                ctx.stroke();
+            });
+            ctx.restore();
+        }
+        if (lassoPts && lassoPts.length > 1) {
+            ctx.save();
+            ctx.strokeStyle = '#fde047';
+            ctx.fillStyle = 'rgba(253, 224, 71, 0.08)';
+            ctx.setLineDash([5, 4]);
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(lassoPts[0][0], lassoPts[0][1]);
+            lassoPts.slice(1).forEach(([x, y]) => ctx.lineTo(x, y));
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+            ctx.restore();
+        }
+
         // Third Draw: Tooltip Overlay (Top Layer)
         if (hoveredIndex >= 0 && hoveredIndex < N) {
             const item = items[hoveredIndex];
@@ -1249,40 +1316,17 @@
     // INTERACTION CONTROLLERS (Sliders, Canvas, Upload, Export)
     // ==========================================================================
     
-    function setupSliders() {
-        const sliderDup = document.getElementById('slider-dup');
-        const sliderOutCentroid = document.getElementById('slider-out-centroid');
-        const sliderMisK = document.getElementById('slider-mis-k');
-        const sliderMisConsensus = document.getElementById('slider-mis-consensus');
-        
-        sliderDup.addEventListener('input', (e) => {
-            dupThreshold = parseFloat(e.target.value);
-            document.getElementById('val-dup').textContent = dupThreshold.toFixed(2);
-            recomputeCuration();
-        });
-        
-        sliderOutCentroid.addEventListener('input', (e) => {
-            outCentroidThreshold = parseFloat(e.target.value);
-            document.getElementById('val-out-centroid').textContent = outCentroidThreshold.toFixed(2);
-            recomputeCuration();
-        });
-        
-        sliderMisK.addEventListener('input', (e) => {
-            mislabelK = parseInt(e.target.value);
-            document.getElementById('val-mis-k').textContent = mislabelK;
-            recomputeCuration();
-        });
-        
-        sliderMisConsensus.addEventListener('input', (e) => {
-            mislabelConsensus = parseFloat(e.target.value);
-            document.getElementById('val-mis-consensus').textContent = mislabelConsensus.toFixed(2);
-            recomputeCuration();
-        });
-    }
-    
     function setupCanvas() {
         // Drag to Pan or Rotate
         canvas.addEventListener('mousedown', (e) => {
+            if (e.shiftKey && !is3D) {  // shift+drag = lasso select (2D map)
+                const r = canvas.getBoundingClientRect();
+                lassoPts = [[e.clientX - r.left, e.clientY - r.top]];
+                if (!(e.ctrlKey || e.metaKey)) lassoSel.clear();
+                closePointPopup();
+                e.preventDefault();
+                return;
+            }
             isDrawing = true;
             dragStart.x = e.clientX;
             dragStart.y = e.clientY;
@@ -1297,6 +1341,11 @@
             const mouseX = e.clientX - rect.left;
             const mouseY = e.clientY - rect.top;
             
+            if (lassoPts) {
+                lassoPts.push([mouseX, mouseY]);
+                drawCanvas();
+                return;
+            }
             if (isDrawing) {
                 const dx = e.clientX - dragStart.x;
                 const dy = e.clientY - dragStart.y;
@@ -1343,7 +1392,13 @@
             }
         });
         
-        window.addEventListener('mouseup', () => {
+        window.addEventListener('mouseup', (e) => {
+            if (lassoPts) {
+                finishLasso();
+                suppressClick = true;
+                return;
+            }
+            if (isDrawing) lastDragDist = Math.hypot(e.clientX - dragStart.x, e.clientY - dragStart.y);
             isDrawing = false;
         });
         
@@ -1391,7 +1446,8 @@
         // 3D Mode Toggle Listener
         document.getElementById('btn-plot-toggle-3d').addEventListener('click', (e) => {
             is3D = !is3D;
-            e.target.classList.toggle('active', is3D);
+            e.currentTarget.classList.toggle('active', is3D);
+            closePointPopup();
             
             const cardTitle = document.getElementById('plot-card-title');
             const instructions = document.getElementById('plot-instructions');
@@ -1400,8 +1456,8 @@
                 cardTitle.innerHTML = '<i class="fa-solid fa-cube"></i> Interactive 3D Embedding Space (PCA Projection)';
                 instructions.innerHTML = '<i class="fa-solid fa-arrows-spin"></i> Drag to rotate | <i class="fa-solid fa-magnifying-glass-plus"></i> Scroll to zoom | Click point to inspect';
             } else {
-                cardTitle.innerHTML = '<i class="fa-solid fa-circle-nodes"></i> Interactive 2D Embedding Space (PCA Projection)';
-                instructions.innerHTML = '<i class="fa-solid fa-arrows-up-down-left-right"></i> Drag to pan | <i class="fa-solid fa-magnifying-glass-plus"></i> Scroll to zoom | Click point to inspect';
+                cardTitle.innerHTML = '<i class="fa-solid fa-circle-nodes"></i> Interactive 2D Embedding Space (t-SNE)';
+                instructions.innerHTML = '<i class="fa-solid fa-arrows-up-down-left-right"></i> Drag to pan | <i class="fa-solid fa-magnifying-glass-plus"></i> Scroll to zoom | Click point to inspect | Shift+drag to select';
             }
             
             resetCanvasView();
@@ -1409,15 +1465,14 @@
         
         // Click to Select item
         canvas.addEventListener('click', (e) => {
-            if (isDrawing) {
-                const clickMoveDist = Math.sqrt(Math.pow(e.clientX - dragStart.x, 2) + Math.pow(e.clientY - dragStart.y, 2));
-                if (clickMoveDist > 3) return; // It was a drag rotation/pan
-            }
-            
+            if (suppressClick) { suppressClick = false; return; }  // end of a lasso
+            if (lastDragDist > 3) { lastDragDist = 0; return; }   // it was a pan / rotation drag
             if (hoveredIndex >= 0) {
                 selectedIndex = hoveredIndex;
-                openPointModal(hoveredIndex);
+                openPointPopup(hoveredIndex);
                 drawCanvas();
+            } else {
+                closePointPopup();
             }
         });
 
@@ -1436,6 +1491,12 @@
             resizeTimer = setTimeout(() => { if (activeTab === 'overview') resetCanvasView(); }, 80);
         });
         setupPointModal();
+        setupSelectionBar();
+        // click anywhere outside the small popup closes it (canvas clicks are handled by the canvas)
+        document.addEventListener('mousedown', e => {
+            const pop = document.getElementById('point-pop');
+            if (pointPopupIdx >= 0 && pop && !pop.contains(e.target) && e.target !== canvas) closePointPopup();
+        });
     }
 
     // ==========================================================================
@@ -1563,6 +1624,7 @@
                 setter(parseFloat(e.target.value));
                 updateSliderLabels();
                 misCursor = -1;
+                outCursor = -1;
                 recomputeCuration();
                 saveState();
             });
@@ -1636,6 +1698,8 @@
             const modalOpen = !document.getElementById('frame-modal').classList.contains('hidden');
             const pointOpen = !document.getElementById('point-modal').classList.contains('hidden');
             if (e.key === 'Escape') {
+                if (pointPopupIdx >= 0 && !modalOpen && !pointOpen) { closePointPopup(); return; }
+                if (lassoSel.size && !modalOpen && !pointOpen) { clearSelection(); return; }
                 if (modalOpen) closeFrame();
                 else if (pointOpen) closePointModal();
                 else if (isPlotFullscreen()) togglePlotFullscreen();
@@ -1646,21 +1710,294 @@
                 e.preventDefault();
                 return;
             }
-            if (activeTab !== 'mislabels' || misCursor < 0) return;
-            const it = mislabelList[misCursor];
-            if (!it) return;
+            if (e.ctrlKey || e.metaKey || e.altKey) return;
             const key = e.key.toLowerCase();
+            if (key === 'u' && !modalOpen && !pointOpen && ['mislabels', 'outliers', 'overview'].includes(activeTab)) {
+                undoLast(); e.preventDefault(); return;
+            }
+            if ((activeTab !== 'mislabels' && activeTab !== 'outliers') || pointOpen) return;
+            const list = activeTab === 'mislabels' ? mislabelList : outlierList;
+            const cur = activeTab === 'mislabels' ? misCursor : outCursor;
+            if (!list.length) return;
+            const isNext = e.key === 'ArrowDown' || e.key === 'ArrowRight' || key === 'd' || key === 'j';
+            const isPrev = e.key === 'ArrowUp' || e.key === 'ArrowLeft' || key === 'w';
+            if (cur < 0 || cur >= list.length) {
+                if (isNext || isPrev) { selectReview(0); e.preventDefault(); }
+                return;
+            }
+            const it = list[cur];
             if (key === 'e') return;  // edit boxes: handled by editor.js
-            if (key === 'r') relabelCrop(it.id, it.curLabel, it.pred);
-            else if (key === 'k') approveCrop(it.id, `Confirmed label '${it.curLabel}'.`);
-            else if (key === 'x' || e.key === 'Delete') excludeCrop(it.id, 'Deleted suspected mislabeled box.');
+            const tag = activeTab === 'mislabels' ? 'suspected mislabeled' : 'unusual';
+            const n = /^[1-9]$/.test(e.key) ? +e.key : 0;
+            if (key === 'a' || key === 'k') decideKb(it, () => approveCrop(it.id, `Confirmed label '${it.curLabel}'.`));
+            else if (key === 'x' || e.key === 'Delete') decideKb(it, () => excludeCrop(it.id, `Deleted ${tag} box.`));
+            else if (key === 'r') { if (!it.pred || it.pred === it.curLabel) return; decideKb(it, () => relabelCrop(it.id, it.curLabel, it.pred)); }
+            else if (n) {
+                const cls = classNames[n - 1];
+                if (!cls || cls === it.curLabel) return;
+                decideKb(it, () => relabelCrop(it.id, it.curLabel, cls));
+            }
             else if (key === 'f') { modalOpen ? closeFrame() : openFrame(it.id); e.preventDefault(); return; }
-            else if (key === 'd' || e.key === 'ArrowDown' || key === 'j') selectMislabelItem(Math.min(misCursor + 1, Math.min(mislabelList.length, shown.mislabels) - 1));
-            else if (key === 'a' || e.key === 'ArrowUp') selectMislabelItem(Math.max(misCursor - 1, 0));
+            else if (isNext) selectReview(cur + 1);
+            else if (isPrev) selectReview(cur - 1);
             else return;
             closeFrame();
             e.preventDefault();
         });
+    }
+
+    function selectReview(idx) {
+        const list = activeTab === 'mislabels' ? mislabelList : outlierList;
+        const max = Math.min(list.length, activeTab === 'mislabels' ? shown.mislabels : shown.outliers) - 1;
+        if (max < 0) return;
+        idx = Math.max(0, Math.min(idx, max));
+        if (activeTab === 'mislabels') selectMislabelItem(idx); else selectOutlierCard(idx);
+    }
+
+    function selectOutlierCard(idx) {
+        const it = outlierList[idx];
+        if (!it) { outCursor = -1; return; }
+        outCursor = idx;
+        selectedIndex = it.index;
+        document.querySelectorAll('#outliers-grid-container .outlier-card').forEach(card => {
+            const on = parseInt(card.dataset.idx) === idx;
+            card.classList.toggle('kb-active', on);
+            if (on) card.scrollIntoView({ block: 'nearest' });
+        });
+    }
+
+    function decideKb(it, fn) {
+        reviewUndo.push([it.id]);
+        fn();
+    }
+
+    function undoLast() {
+        const ids = reviewUndo.pop();
+        if (!ids) return;
+        ids.forEach(id => {
+            deletedIds.delete(id); relabeledLabels.delete(id); keptIds.delete(id);
+            for (let i = actionsLog.length - 1; i >= 0; i--) if (actionsLog[i].id === id) actionsLog.splice(i, 1);
+        });
+        saveState();
+        recomputeCuration();
+        if (activeTab === 'mislabels' || activeTab === 'outliers') {
+            const list = activeTab === 'mislabels' ? mislabelList : outlierList;
+            const idx = list.findIndex(x => x.id === ids[0]);
+            if (idx >= 0) selectReview(idx);
+        }
+        if (pointPopupIdx >= 0) refreshPointPopup();
+    }
+
+    // ==========================================================================
+    // CLUSTERS (colour by class / cluster)
+    // ==========================================================================
+
+    const hasClusters = () => !!reportData && reportData.items.some(it => it.cluster !== null && it.cluster !== undefined);
+    const clusterColor = c => `hsl(${(c * 137.508 + 20) % 360}, 75%, 58%)`;
+
+    function pointColor(item) {
+        if (colorBy === 'cluster' && item.cluster !== null && item.cluster !== undefined) return clusterColor(item.cluster);
+        return classColors[item.curLabel] || defaultColor;
+    }
+
+    function clusterSummary() {
+        // Same rules as cluster_summary() in the Python backend, but on the current (reviewed) labels
+        const groups = new Map();
+        reportData.items.forEach(it => {
+            if (it.curDeleted || it.cluster === null || it.cluster === undefined) return;
+            if (!groups.has(it.cluster)) groups.set(it.cluster, []);
+            groups.get(it.cluster).push(it);
+        });
+        return [...groups.entries()].sort((a, b) => a[0] - b[0]).map(([c, g]) => {
+            const counts = {};
+            g.forEach(it => { counts[it.curLabel] = (counts[it.curLabel] || 0) + 1; });
+            const [major, nMajor] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+            const purity = nMajor / g.length;
+            const unusual = g.filter(it => it.lof >= lofThreshold).length / g.length;
+            const hint = purity < 0.7 ? 'mixed: check labels'
+                : unusual >= 0.3 ? 'many unusual boxes: background-like?'
+                : purity < 0.9 ? 'check the minority boxes' : 'clean';
+            return { cluster: c, size: g.length, major, purity, hint };
+        });
+    }
+
+    function renderPlotLegend() {
+        const el = document.getElementById('plot-legend');
+        const btn = document.getElementById('btn-plot-color');
+        if (btn) {
+            btn.disabled = !hasClusters();
+            btn.title = btn.disabled ? 'No clusters in this report: run the analysis again' : 'Colour points by class or by embedding cluster';
+            btn.innerHTML = `<i class="fa-solid fa-palette"></i> Color: ${colorBy}`;
+        }
+        if (colorBy === 'cluster' && hasClusters()) {
+            el.innerHTML = clusterSummary().map(s => `<div class="legend-item cluster-legend" title="${esc(s.hint)}">
+                <div class="legend-dot" style="background-color:${clusterColor(s.cluster)};"></div>
+                <span>C${s.cluster} · ${s.size} · ${esc(s.major)} ${Math.round(s.purity * 100)}% · <i class="${s.hint === 'clean' ? 'hint-ok' : 'hint-warn'}">${esc(s.hint)}</i></span></div>`).join('');
+        } else {
+            el.innerHTML = Object.entries(classColors).map(([cls, color]) =>
+                `<div class="legend-item"><div class="legend-dot" style="background-color:${color};"></div><span>${esc(cls)}</span></div>`).join('');
+        }
+    }
+
+    // ==========================================================================
+    // LASSO SELECTION ON THE 2D MAP
+    // ==========================================================================
+
+    function pointInPolygon(x, y, poly) {
+        let inside = false;
+        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+            const [xi, yi] = poly[i], [xj, yj] = poly[j];
+            if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+        }
+        return inside;
+    }
+
+    function finishLasso() {
+        const poly = lassoPts;
+        lassoPts = null;
+        if (poly && poly.length >= 3) {
+            const xs = poly.map(p => p[0]), ys = poly.map(p => p[1]);
+            const w = Math.max(...xs) - Math.min(...xs), h = Math.max(...ys) - Math.min(...ys);
+            // A short straight drag is treated as a box (rectangle) select
+            const area = poly.length < 6 ? null : poly;
+            const rect = [[Math.min(...xs), Math.min(...ys)], [Math.max(...xs), Math.min(...ys)], [Math.max(...xs), Math.max(...ys)], [Math.min(...xs), Math.max(...ys)]];
+            const shape = area || rect;
+            if (w > 3 || h > 3) {
+                reportData.items.forEach((it, i) => {
+                    if (it.curDeleted) return;
+                    const [px, py] = getProjectedCoord(i);
+                    if (pointInPolygon(px * viewZoom + viewPanX, py * viewZoom + viewPanY, shape)) lassoSel.add(i);
+                });
+            }
+        }
+        updateSelectionBar();
+        drawCanvas();
+    }
+
+    function updateSelectionBar() {
+        const bar = document.getElementById('plot-selection');
+        if (!bar) return;
+        if (!lassoSel.size) { bar.classList.add('hidden'); return; }
+        const counts = {};
+        lassoSel.forEach(i => { const it = reportData.items[i]; counts[it.curLabel] = (counts[it.curLabel] || 0) + 1; });
+        const mix = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([c, n]) => `${esc(c)} ${n}`).join(', ');
+        document.getElementById('ps-count').innerHTML = `<b>${lassoSel.size}</b> selected (${mix})`;
+        document.getElementById('ps-relabel').innerHTML = classOptions();
+        bar.classList.remove('hidden');
+    }
+
+    function clearSelection() {
+        lassoSel.clear();
+        updateSelectionBar();
+        drawCanvas();
+    }
+
+    function bulkDecide(kind, newLabel) {
+        const ids = [];
+        lassoSel.forEach(i => {
+            const it = reportData.items[i];
+            if (!it || it.removed) return;
+            ids.push(it.id);
+            if (kind === 'approve') {
+                deletedIds.delete(it.id); keptIds.add(it.id);
+                registerAction({ type: 'keep', id: it.id, description: `Confirmed '${it.curLabel}' (map selection).` });
+            } else if (kind === 'remove') {
+                deletedIds.add(it.id); keptIds.delete(it.id);
+                registerAction({ type: 'delete', id: it.id, description: 'Deleted box (map selection).' });
+            } else if (newLabel && newLabel !== it.curLabel) {
+                if (newLabel === it.label) relabeledLabels.delete(it.id); else relabeledLabels.set(it.id, newLabel);
+                registerAction({ type: 'relabel', id: it.id, old_label: it.curLabel, new_label: newLabel, description: `Relabeled ${it.id}: '${it.curLabel}' → '${newLabel}' (map selection).` });
+            }
+        });
+        if (ids.length) reviewUndo.push(ids);
+        lassoSel.clear();
+        recomputeCuration();
+        updateSelectionBar();
+    }
+
+    function setupSelectionBar() {
+        const bar = document.getElementById('plot-selection');
+        if (!bar) return;
+        document.getElementById('ps-approve').onclick = () => bulkDecide('approve');
+        document.getElementById('ps-remove').onclick = () => bulkDecide('remove');
+        document.getElementById('ps-relabel-btn').onclick = () => bulkDecide('relabel', document.getElementById('ps-relabel').value);
+        document.getElementById('ps-clear').onclick = clearSelection;
+        document.getElementById('btn-plot-color').addEventListener('click', () => {
+            if (!hasClusters()) return;
+            colorBy = colorBy === 'class' ? 'cluster' : 'class';
+            renderPlotLegend();
+            drawCanvas();
+        });
+    }
+
+    // ==========================================================================
+    // SMALL POINT POPUP (click on the map)
+    // ==========================================================================
+
+    let pointPopupIdx = -1;
+
+    function pointHint(it) {
+        if (it.curDeleted) return 'Marked for removal. Undo to keep it.';
+        if (relabeledLabels.has(it.id)) return `Relabeled ${it.label} → ${it.curLabel}.`;
+        if (it.curKept) return 'Approved.';
+        if (it.is_mislabeled) return `Model thinks ${it.pred} (${pct(it.pred_conf)}): relabel?`;
+        if (it.has_issue) return `${it.issues[0]}: fix or remove.`;
+        if (it.is_outlier) return 'Unusual box: check or remove.';
+        if (it.is_duplicate) return 'Near-duplicate of another box: consider removing one.';
+        return 'Looks fine: approve or skip.';
+    }
+
+    function openPointPopup(idx) {
+        const it = reportData.items[idx];
+        if (!it) return;
+        pointPopupIdx = idx;
+        updateHoverPreview(0, 0, null);
+        const pop = document.getElementById('point-pop');
+        const [px, py] = getProjectedCoord(idx);
+        const sx = px * viewZoom + viewPanX, sy = py * viewZoom + viewPanY;
+        const W = canvas.clientWidth, H = canvas.clientHeight, PW = 240, PH = 300;
+        pop.style.left = `${Math.max(8, Math.min(sx + 14 + PW > W ? sx - PW - 14 : sx + 14, W - PW - 8))}px`;
+        pop.style.top = `${Math.max(8, Math.min(sy - 40, H - PH - 8))}px`;
+        refreshPointPopup();
+        pop.classList.remove('hidden');
+    }
+
+    function refreshPointPopup() {
+        const it = reportData && reportData.items[pointPopupIdx];
+        if (!it) return;
+        const pop = document.getElementById('point-pop');
+        const others = classNames.filter(c => c !== it.curLabel);
+        const def = it.pred && it.pred !== it.curLabel ? it.pred : others[0];
+        pop.innerHTML = `
+            <button class="pp-close" title="Close (Esc)">×</button>
+            <img src="${esc(it.path)}" alt="">
+            <div class="pp-line">${pill(it.curLabel)} <span>model: <b>${esc(it.pred || 'n/a')}</b> ${it.pred ? pct(it.pred_conf) : ''}</span></div>
+            <div class="pp-line">${it.cluster !== null && it.cluster !== undefined ? `cluster <b>C${it.cluster}</b> · ` : ''}${esc(it.split)} · LOF ${it.lof.toFixed(2)}</div>
+            <div class="pp-hint">${esc(pointHint(it))}</div>
+            <div class="pp-actions">
+                <button class="btn btn-small pp-ok" data-pp="approve" title="Approve"><i class="fa-solid fa-check"></i></button>
+                <button class="btn btn-small pp-del" data-pp="remove" title="Remove box"><i class="fa-solid fa-trash"></i></button>
+                <select class="pp-select">${others.map(c => `<option value="${esc(c)}" ${c === def ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+                <button class="btn btn-small" data-pp="relabel" title="Relabel">Relabel</button>
+                ${itemDecision(it) ? '<button class="btn btn-small" data-pp="undo" title="Undo decision"><i class="fa-solid fa-rotate-left"></i></button>' : ''}
+            </div>
+            <a href="#" class="pp-full">view full image</a>`;
+        pop.querySelector('.pp-close').onclick = closePointPopup;
+        pop.querySelector('.pp-full').onclick = ev => { ev.preventDefault(); const i = pointPopupIdx; closePointPopup(); openPointModal(i); };
+        pop.querySelectorAll('[data-pp]').forEach(b => b.onclick = () => {
+            const act = b.dataset.pp;
+            if (act === 'approve') { if (it.curDeleted) deletedIds.delete(it.id); reviewUndo.push([it.id]); approveCrop(it.id, `Confirmed '${it.curLabel}' from the similarity map.`); }
+            else if (act === 'remove') { reviewUndo.push([it.id]); excludeCrop(it.id, 'Deleted box from the similarity map.'); }
+            else if (act === 'relabel') { const nl = pop.querySelector('.pp-select').value; if (nl && nl !== it.curLabel) { reviewUndo.push([it.id]); relabelCrop(it.id, it.curLabel, nl); } }
+            else if (act === 'undo') undoCrop(it.id);
+            refreshPointPopup();
+        });
+    }
+
+    function closePointPopup() {
+        const pop = document.getElementById('point-pop');
+        if (pop) pop.classList.add('hidden');
+        pointPopupIdx = -1;
     }
 
     // --- Audit file export ---
